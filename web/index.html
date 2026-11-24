@@ -305,7 +305,7 @@
         </label>
         <label>
           <span>初期資金上書き（空欄=各パターン設定）</span>
-          <input id="btCapital" type="number" class="text-input" placeholder="例: 100000 / 300000" min="1000" step="10000" />
+          <input id="btCapital" type="number" class="text-input" placeholder="例: 100000 / 300000" min="1000" step="1" />
         </label>
         <button type="submit" id="btnRunBacktest" class="btn btn-accent">
           ▶ 実データで並行測定を実行
@@ -418,7 +418,7 @@
         <label class="full-span">
           <span>初期資金 (円) — 任意金額に変更可能</span>
           <div class="capital-row">
-            <input name="initial_capital" type="number" min="1000" step="10000" required class="text-input" />
+            <input name="initial_capital" type="number" min="1000" step="1" required class="text-input" />
             <div class="preset-btns">
               <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="50000">5万</button>
               <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="100000">10万</button>
@@ -431,7 +431,7 @@
         <label>
           <span>戦略タイプ（予測モデル）</span>
           <select name="strategy_type" class="select-input">
-            <option value="ml_walkforward">🤖 Walk-Forward 機械学習 (Ridge回帰)</option>
+            <option value="ml_walkforward">🤖 Walk-Forward 機械学習 (Ridge + HistGBDT)</option>
             <option value="mean_reversion">📉 押し目買い平均回帰ルール</option>
             <option value="trend">📈 テクニカル順張りルール</option>
           </select>
@@ -448,7 +448,7 @@
         </label>
         <label>
           <span>ML最低期待リターン閾値 (%, コスト超え厳選)</span>
-          <input name="ml_min_pred_return" type="number" min="0.1" max="5" step="0.1" class="text-input" />
+          <input name="ml_min_pred_return" type="number" min="0.1" max="10" step="any" class="text-input" />
         </label>
         <label>
           <span>最大保有本数 (0=制限なし, 例: 12本=6時間)</span>
@@ -474,51 +474,51 @@
         </label>
         <label>
           <span>最大同時保有銘柄数</span>
-          <input name="max_positions" type="number" min="1" max="20" class="text-input" />
+          <input name="max_positions" type="number" min="1" max="20" step="1" class="text-input" />
         </label>
         <label>
           <span>1銘柄あたり最大投資比率 (%)</span>
-          <input name="max_allocation_pct" type="number" min="10" max="100" step="5" class="text-input" />
+          <input name="max_allocation_pct" type="number" min="5" max="100" step="any" class="text-input" />
         </label>
         <label>
           <span>買い推奨スコア閾値 (0-100)</span>
-          <input name="buy_score_threshold" type="number" min="40" max="90" step="1" class="text-input" />
+          <input name="buy_score_threshold" type="number" min="30" max="95" step="any" class="text-input" />
         </label>
         <label>
           <span>強い買いスコア閾値 (0-100)</span>
-          <input name="strong_buy_threshold" type="number" min="50" max="98" step="1" class="text-input" />
+          <input name="strong_buy_threshold" type="number" min="40" max="99" step="any" class="text-input" />
         </label>
         <label>
           <span>売りシグナルスコア閾値 (0-100)</span>
-          <input name="sell_score_threshold" type="number" min="10" max="60" step="1" class="text-input" />
+          <input name="sell_score_threshold" type="number" min="5" max="65" step="any" class="text-input" />
         </label>
         <label>
           <span>利確目標 (%)</span>
-          <input name="take_profit_pct" type="number" min="0.5" max="30" step="0.5" class="text-input" />
+          <input name="take_profit_pct" type="number" min="0.3" max="50" step="any" class="text-input" />
         </label>
         <label>
           <span>損切りライン (%)</span>
-          <input name="stop_loss_pct" type="number" min="0.5" max="20" step="0.5" class="text-input" />
+          <input name="stop_loss_pct" type="number" min="0.3" max="50" step="any" class="text-input" />
         </label>
         <label>
           <span>トレーリング発動利益 (%)</span>
-          <input name="trailing_activation_pct" type="number" min="0.5" max="15" step="0.5" class="text-input" />
+          <input name="trailing_activation_pct" type="number" min="0.2" max="50" step="any" class="text-input" />
         </label>
         <label>
           <span>トレーリング反落幅 (%)</span>
-          <input name="trailing_stop_pct" type="number" min="0.3" max="10" step="0.2" class="text-input" />
+          <input name="trailing_stop_pct" type="number" min="0.2" max="50" step="any" class="text-input" />
         </label>
         <label>
           <span>取引手数料率 (%, 例: 0.10 / かぶミニ 0.22 / ゼロ革命 0)</span>
-          <input name="fee_rate" type="number" min="0" max="5" step="0.01" class="text-input" />
+          <input name="fee_rate" type="number" min="0" max="5" step="any" class="text-input" />
         </label>
         <label>
           <span>譲渡益税率 (%, 特定口座 20.315 / 簡易 20 / NISA 0)</span>
-          <input name="tax_rate" type="number" min="0" max="50" step="0.005" class="text-input" />
+          <input name="tax_rate" type="number" min="0" max="50" step="any" class="text-input" />
         </label>
         <label>
           <span>スリッページ想定 (bps, 5=0.05%)</span>
-          <input name="slippage_bps" type="number" min="0" max="100" step="1" class="text-input" />
+          <input name="slippage_bps" type="number" min="0" max="200" step="any" class="text-input" />
         </label>
         <label class="checkbox-label">
           <input name="close_before_eod" type="checkbox" />
