@@ -6,6 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+import pandas as pd
 
 from .config import (
     AppConfig,
@@ -16,7 +17,7 @@ from .config import (
     MODE_LABELS,
     MODE_UNIT_SIZE,
 )
-from .market_data import now_jst, tse_market_status
+from .market_data import JST, now_jst, tse_market_status
 
 
 SCHEMA_SQL = """
@@ -101,6 +102,33 @@ CREATE TABLE IF NOT EXISTS latest_snapshots (
     recommendations_json TEXT NOT NULL,
     sell_evaluations_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ml_bars (
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume REAL NOT NULL,
+    PRIMARY KEY (symbol, interval, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ml_bars_iv_sym_ts ON ml_bars (interval, symbol, timestamp ASC);
+
+CREATE TABLE IF NOT EXISTS ml_model_status (
+    interval TEXT PRIMARY KEY,
+    updated_at TEXT NOT NULL,
+    diagnostics_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    until_ts TEXT NOT NULL,
+    PRIMARY KEY (mode, symbol)
+);
 """
 
 
@@ -134,6 +162,7 @@ class Storage:
             # Safe schema migrations for existing DB files
             self._ensure_column(conn, "portfolios", "total_tax", "REAL NOT NULL DEFAULT 0.0")
             self._ensure_column(conn, "positions", "buy_fee", "REAL NOT NULL DEFAULT 0.0")
+            self._ensure_column(conn, "positions", "bars_held", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "trades", "signal_time", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "trades", "tax", "REAL NOT NULL DEFAULT 0.0")
 
@@ -176,6 +205,7 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM positions WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM pending_orders WHERE mode = ?", (mode,))
+            conn.execute("DELETE FROM symbol_cooldowns WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM trades WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM equity_history WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM latest_snapshots WHERE mode = ?", (mode,))
@@ -194,6 +224,7 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM positions WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM pending_orders WHERE mode = ?", (mode,))
+            conn.execute("DELETE FROM symbol_cooldowns WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM trades WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM equity_history WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM latest_snapshots WHERE mode = ?", (mode,))
@@ -249,8 +280,8 @@ class Storage:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO positions (mode, symbol, name, quantity, avg_cost, buy_fee, highest_price, target_price, stop_loss_price, entry_time, last_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions (mode, symbol, name, quantity, avg_cost, buy_fee, highest_price, target_price, stop_loss_price, entry_time, last_price, bars_held)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mode, symbol) DO UPDATE SET
                     name = excluded.name,
                     quantity = excluded.quantity,
@@ -260,7 +291,8 @@ class Storage:
                     target_price = excluded.target_price,
                     stop_loss_price = excluded.stop_loss_price,
                     entry_time = excluded.entry_time,
-                    last_price = excluded.last_price
+                    last_price = excluded.last_price,
+                    bars_held = excluded.bars_held
                 """,
                 (
                     mode,
@@ -274,6 +306,7 @@ class Storage:
                     float(pos["stop_loss_price"]),
                     str(pos["entry_time"]),
                     float(pos["last_price"]),
+                    int(pos.get("bars_held", 0)),
                 ),
             )
 
@@ -446,6 +479,171 @@ class Storage:
                 "sell_evaluations": json.loads(row["sell_evaluations_json"]),
             }
 
+    # --- Cooldown Persistence ---
+    def get_cooldowns(self, mode: str) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, until_ts FROM symbol_cooldowns WHERE mode = ?",
+                (mode,),
+            ).fetchall()
+            return {str(r["symbol"]): str(r["until_ts"]) for r in rows}
+
+    def set_cooldown(self, mode: str, symbol: str, until_ts: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO symbol_cooldowns (mode, symbol, until_ts)
+                VALUES (?, ?, ?)
+                ON CONFLICT(mode, symbol) DO UPDATE SET until_ts = excluded.until_ts
+                """,
+                (mode, symbol, until_ts),
+            )
+
+    # --- Persistent ML Training Data Store (accumulates beyond Yahoo Finance 58-day window!) ---
+    def save_ml_bars(
+        self,
+        interval: str,
+        symbol_frames: dict[str, pd.DataFrame],
+        max_bars_per_symbol: int = 3000,
+    ) -> int:
+        """Upsert real OHLCV bars into SQLite so ML training data grows continuously over months."""
+        if not symbol_frames:
+            return 0
+        total_upserted = 0
+        with self._connect() as conn:
+            for sym, df in symbol_frames.items():
+                if df is None or df.empty:
+                    continue
+                records = []
+                for ts, row in df.iterrows():
+                    ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                    records.append(
+                        (
+                            sym,
+                            interval,
+                            ts_str,
+                            float(row["Open"]),
+                            float(row["High"]),
+                            float(row["Low"]),
+                            float(row["Close"]),
+                            float(row["Volume"]),
+                        )
+                    )
+                if not records:
+                    continue
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO ml_bars (symbol, interval, timestamp, open, high, low, close, volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    records,
+                )
+                total_upserted += len(records)
+                # Keep database compact (~1+ year of 30m bars per symbol)
+                conn.execute(
+                    """
+                    DELETE FROM ml_bars
+                    WHERE symbol = ? AND interval = ? AND timestamp NOT IN (
+                        SELECT timestamp FROM ml_bars
+                        WHERE symbol = ? AND interval = ?
+                        ORDER BY timestamp DESC LIMIT ?
+                    )
+                    """,
+                    (sym, interval, sym, interval, int(max_bars_per_symbol)),
+                )
+        return total_upserted
+
+    def load_ml_bars(self, interval: str, symbols: list[str] | None = None) -> dict[str, pd.DataFrame]:
+        """Load accumulated OHLCV history from SQLite normalized to JST DatetimeIndex."""
+        result: dict[str, pd.DataFrame] = {}
+        with self._connect() as conn:
+            if symbols:
+                placeholders = ",".join("?" for _ in symbols)
+                rows = conn.execute(
+                    f"""
+                    SELECT symbol, timestamp, open, high, low, close, volume
+                    FROM ml_bars
+                    WHERE interval = ? AND symbol IN ({placeholders})
+                    ORDER BY symbol ASC, timestamp ASC
+                    """,
+                    [interval, *symbols],
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, timestamp, open, high, low, close, volume
+                    FROM ml_bars
+                    WHERE interval = ?
+                    ORDER BY symbol ASC, timestamp ASC
+                    """,
+                    (interval,),
+                ).fetchall()
+
+        by_sym: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_sym.setdefault(r["symbol"], []).append(dict(r))
+
+        for sym, items in by_sym.items():
+            idx = pd.to_datetime([it["timestamp"] for it in items], utc=True).tz_convert(JST)
+            df = pd.DataFrame(
+                {
+                    "Open": [it["open"] for it in items],
+                    "High": [it["high"] for it in items],
+                    "Low": [it["low"] for it in items],
+                    "Close": [it["close"] for it in items],
+                    "Volume": [it["volume"] for it in items],
+                },
+                index=idx,
+            )
+            result[sym] = df[~df.index.duplicated(keep="last")].sort_index()
+        return result
+
+    def save_ml_diagnostics(self, interval: str, diagnostics: dict[str, Any]) -> None:
+        now = now_jst().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ml_model_status (interval, updated_at, diagnostics_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(interval) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    diagnostics_json = excluded.diagnostics_json
+                """,
+                (interval, now, json.dumps(diagnostics, ensure_ascii=False)),
+            )
+
+    def get_ml_status(self) -> dict[str, Any]:
+        """Return accumulated ML dataset statistics and latest Walk-Forward OOS diagnostics."""
+        with self._connect() as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COUNT(DISTINCT symbol) AS syms, MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts FROM ml_bars"
+            ).fetchone()
+            iv_rows = conn.execute(
+                """
+                SELECT interval, COUNT(*) AS bars, COUNT(DISTINCT symbol) AS symbols,
+                       MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts
+                FROM ml_bars
+                GROUP BY interval
+                ORDER BY interval ASC
+                """
+            ).fetchall()
+            diag_rows = conn.execute("SELECT interval, updated_at, diagnostics_json FROM ml_model_status").fetchall()
+
+        models: dict[str, Any] = {}
+        for r in diag_rows:
+            d = json.loads(r["diagnostics_json"])
+            d["updated_at"] = r["updated_at"]
+            models[str(r["interval"])] = d
+
+        return {
+            "total_bars": int(total_row["cnt"] or 0),
+            "unique_symbols": int(total_row["syms"] or 0),
+            "earliest_bar": total_row["min_ts"],
+            "latest_bar": total_row["max_ts"],
+            "by_interval": [dict(r) for r in iv_rows],
+            "models": models,
+        }
+
     def build_pattern_summary(self, pattern: SimulationPattern) -> dict[str, Any]:
         summary = self.build_mode_summary(
             mode=pattern.id,
@@ -584,7 +782,8 @@ class Storage:
         snapshot = {
             "generated_at": now_jst().isoformat(),
             "market_status": tse_market_status(),
-            "execution_policy": "事前予測(t足確定) → 次足(t+1)始値約定 / 手数料＋譲渡益課税(約20.315%)控除",
+            "execution_policy": "事前予測(t足確定) → 次足(t+1)始値約定 / 手数料＋譲渡益課税(約20.315%)控除 / Walk-Forward ML継続学習",
+            "ml_status": self.get_ml_status(),
             "config": {
                 "initial_capital": cfg.initial_capital,
                 "interval": cfg.interval,

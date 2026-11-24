@@ -54,7 +54,7 @@ async function decryptDashboardEnvelope(envelope, passphrase) {
 }
 
 function setStaticButtonsDisabled() {
-  ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest"].forEach(
+  ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest", "btnCollectMl"].forEach(
     (id) => {
       const el = document.getElementById(id);
       if (el) el.disabled = true;
@@ -407,6 +407,7 @@ function renderDashboard() {
   msBadge.textContent = ms.session || "東証ステータス不明";
   msBadge.className = `pill ${ms.is_open ? "pill-ok" : "pill-warn"}`;
 
+  renderMlMonitor(dash.ml_status || null);
   renderPatternsTable();
 
   const p = getSelectedPatternData();
@@ -447,6 +448,68 @@ function renderDashboard() {
   renderSellEvaluations(p.sell_evaluations || [], p.positions || []);
   renderRecommendations(p.recommendations || []);
   renderTrades("tradesBody", p.trades || []);
+}
+
+function renderMlMonitor(ml) {
+  const cardsEl = document.getElementById("mlStatusCards");
+  const weightsEl = document.getElementById("mlFeatureWeights");
+  if (!cardsEl) return;
+
+  if (!ml || !ml.total_bars) {
+    cardsEl.innerHTML = `<div class="bt-stat"><div class="bt-stat-label">蓄積学習データ</div><div class="bt-stat-val">未収集</div><div class="stock-meta">スキャンまたは「学習データ収集」で自動蓄積を開始します</div></div>`;
+    if (weightsEl) weightsEl.innerHTML = "";
+    return;
+  }
+
+  const models = ml.models || {};
+  const primaryModel = models["30m"] || models["15m"] || Object.values(models)[0] || null;
+  const ivText = (ml.by_interval || [])
+    .map((x) => `${x.interval}: ${Number(x.bars).toLocaleString("ja-JP")}本`)
+    .join(" / ");
+  const spanText = ml.earliest_bar && ml.latest_bar ? `${fmtTime(ml.earliest_bar)} 〜 ${fmtTime(ml.latest_bar)}` : "--";
+  const icVal = primaryModel ? Number(primaryModel.oos_ic || 0) : 0;
+  const icCls = icVal > 0 ? "up" : icVal < 0 ? "down" : "";
+
+  cardsEl.innerHTML = `
+    <div class="bt-stat">
+      <div class="bt-stat-label">蓄積済み学習バー総数</div>
+      <div class="bt-stat-val">${Number(ml.total_bars).toLocaleString("ja-JP")} 本</div>
+      <div class="stock-meta">${ml.unique_symbols} 銘柄 (${escapeHtml(ivText || "--")})</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">データ蓄積期間 (JST)</div>
+      <div class="bt-stat-val" style="font-size:0.88rem">${escapeHtml(spanText)}</div>
+      <div class="stock-meta">毎回の監視で自動追記・蓄積</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">Walk-Forward OOS 相関 (IC)</div>
+      <div class="bt-stat-val ${icCls}">${icVal >= 0 ? "+" : ""}${icVal.toFixed(4)}</div>
+      <div class="stock-meta">未来情報ゼロ検証 (${primaryModel ? primaryModel.oos_samples : 0}件)</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">高確信ML予測 的中率</div>
+      <div class="bt-stat-val">${primaryModel ? Number(primaryModel.oos_hit_rate_pct || 0).toFixed(1) : "0.0"}%</div>
+      <div class="stock-meta">学習サンプル ${primaryModel ? Number(primaryModel.train_samples || 0).toLocaleString("ja-JP") : 0}件</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">モデル種別</div>
+      <div class="bt-stat-val" style="font-size:0.88rem">${escapeHtml(primaryModel ? primaryModel.model_type : "Walk-Forward Ridge")}</div>
+      <div class="stock-meta">基準足: ${escapeHtml(primaryModel ? primaryModel.interval : "30m")} / 予測幅 ${primaryModel ? primaryModel.horizon_bars : 8}本</div>
+    </div>
+  `;
+
+  if (weightsEl && primaryModel && primaryModel.top_features && primaryModel.top_features.length > 0) {
+    weightsEl.innerHTML =
+      `<span class="stock-meta" style="margin-right:4px;">学習済み主要特徴量:</span>` +
+      primaryModel.top_features
+        .map(
+          (f) =>
+            `<span class="reason-chip">${escapeHtml(f.label)} (${f.weight >= 0 ? "+" : ""}${f.weight} / ${escapeHtml(f.direction)})</span>`
+        )
+        .join("");
+  } else if (weightsEl) {
+    weightsEl.innerHTML = "";
+  }
 }
 
 function renderPendingOrders(orders, interval) {
@@ -864,10 +927,14 @@ function openPatternModal(patternId = null, duplicate = false) {
     resetWrap.classList.add("hidden");
   }
 
-  form.name.value = pat ? (duplicate ? `${pat.name} (コピー)` : pat.name) : "カスタムパターン 30万円（15分足）";
+  form.name.value = pat ? (duplicate ? `${pat.name} (コピー)` : pat.name) : "🤖 MLカスタム 30万円（30分足）";
   form.description.value = pat ? pat.description || "" : "";
+  form.strategy_type.value = pat ? pat.strategy_type || "ml_walkforward" : "ml_walkforward";
   form.initial_capital.value = pat ? pat.initial_capital : 300000;
-  form.interval.value = pat ? pat.interval : "15m";
+  form.interval.value = pat ? pat.interval : "30m";
+  form.ml_min_pred_return.value = ((pat ? pat.ml_min_pred_return ?? 0.008 : 0.008) * 100).toFixed(1);
+  form.max_hold_bars.value = pat ? (pat.max_hold_bars ?? 12) : 12;
+  form.cooldown_bars.value = pat ? (pat.cooldown_bars ?? 6) : 6;
   form.unit_size.value = String(pat ? pat.unit_size : 1);
   form.watchlist_key.value = pat ? pat.watchlist_key : "lot1";
   form.max_positions.value = pat ? pat.max_positions : 3;
@@ -897,8 +964,12 @@ async function savePatternForm(e) {
   const payload = {
     name: form.name.value.trim(),
     description: form.description.value.trim(),
+    strategy_type: form.strategy_type.value,
     initial_capital: Number(form.initial_capital.value),
     interval: form.interval.value,
+    ml_min_pred_return: Number(form.ml_min_pred_return.value) / 100,
+    max_hold_bars: Number(form.max_hold_bars.value),
+    cooldown_bars: Number(form.cooldown_bars.value),
     unit_size: Number(form.unit_size.value),
     watchlist_key: form.watchlist_key.value,
     max_positions: Number(form.max_positions.value),
@@ -1033,6 +1104,26 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
+  document.getElementById("btnCollectMl").addEventListener("click", async () => {
+    if (!state.apiAvailable) return;
+    const btn = document.getElementById("btnCollectMl");
+    btn.disabled = true;
+    btn.textContent = "⏳ 学習データ収集＆再学習中...";
+    try {
+      const resp = await fetch("/api/ml/collect", { method: "POST" });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "MLデータ収集に失敗しました");
+      state.dashboard = data.dashboard;
+      renderDashboard();
+      const total = data.ml && data.ml.ml_status ? data.ml.ml_status.total_bars : 0;
+      showToast(`機械学習データ収集＆再学習完了（蓄積総数: ${Number(total).toLocaleString("ja-JP")}本）`);
+    } catch (err) {
+      showToast(`ML収集エラー: ${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "📥 学習データ収集＆再学習";
+    }
+  });
   document.getElementById("btnLogout").addEventListener("click", handleLogout);
   document.getElementById("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();

@@ -69,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     p_enc.add_argument("--remove-plaintext", action="store_true", help="暗号化後に平文ファイルを削除")
     sub.add_parser("decrypt-state", help="暗号化済みDB(kabushiki.db.enc)を復号")
 
+    # collect-ml-data
+    p_ml = sub.add_parser("collect-ml-data", help="機械学習用の日中足データ(銘柄+日経平均)を収集・蓄積しOOS精度を計測")
+    p_ml.add_argument("--days", type=int, default=55)
+
     # reset
     p_reset = sub.add_parser("reset", help="シミュレーション資産を初期資金にリセット")
     p_reset.add_argument("--pattern", default="all", help="パターンID または all")
@@ -230,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
             print("Decrypted DB restored.")
         else:
             print("No encrypted DB found; starting fresh or using existing DB.")
+        return 0
+
+    if args.command == "collect-ml-data":
+        out = sim.collect_ml_data(intervals=("15m", "30m"), period_days=args.days)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "reset":

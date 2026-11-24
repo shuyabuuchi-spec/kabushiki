@@ -17,6 +17,13 @@ DEFAULT_SNAPSHOT_PATH = PROJECT_ROOT / "data" / "dashboard_snapshot.json"
 WEB_SNAPSHOT_PATH = PROJECT_ROOT / "web" / "data" / "dashboard_snapshot.json"
 
 SUPPORTED_INTERVALS = ("5m", "10m", "15m", "30m", "60m")
+SUPPORTED_STRATEGIES = ("ml_walkforward", "mean_reversion", "trend")
+
+STRATEGY_LABELS = {
+    "ml_walkforward": "Walk-Forward 機械学習 (Ridge)",
+    "mean_reversion": "押し目買い平均回帰",
+    "trend": "テクニカル順張り",
+}
 
 MODE_UNIT_SIZE = {
     "lot1": 1,
@@ -42,6 +49,7 @@ class SimulationPattern:
     name: str
     description: str = ""
     enabled: bool = True
+    strategy_type: str = "trend"
     initial_capital: float = 100000.0
     unit_size: int = 1
     watchlist_key: str = "lot1"
@@ -59,10 +67,16 @@ class SimulationPattern:
     trailing_activation_pct: float = 0.015
     trailing_stop_pct: float = 0.01
     close_before_eod: bool = False
+    ml_min_pred_return: float = 0.008
+    ml_horizon_bars: int = 8
+    max_hold_bars: int = 12
+    cooldown_bars: int = 6
 
     def __post_init__(self) -> None:
         if self.interval not in SUPPORTED_INTERVALS:
             self.interval = "15m"
+        if self.strategy_type not in SUPPORTED_STRATEGIES:
+            self.strategy_type = "trend"
         self.unit_size = 100 if int(self.unit_size) >= 100 else 1
         self.initial_capital = max(1000.0, float(self.initial_capital))
         if self.watchlist_key not in ("lot1", "lot100"):

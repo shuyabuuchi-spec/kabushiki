@@ -55,29 +55,35 @@ class PatternCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
     description: str = Field(default="", max_length=200)
     enabled: bool = Field(default=True)
+    strategy_type: str = Field(default="ml_walkforward")
     initial_capital: float = Field(default=100000.0, ge=1000.0, le=1000000000.0)
     unit_size: int = Field(default=1)
     watchlist_key: str = Field(default="lot1")
-    interval: str = Field(default="15m")
+    interval: str = Field(default="30m")
     max_positions: int = Field(default=3, ge=1, le=20)
-    max_allocation_pct: float = Field(default=0.4, ge=0.05, le=1.0)
+    max_allocation_pct: float = Field(default=0.45, ge=0.05, le=1.0)
     fee_rate: float = Field(default=0.001, ge=0.0, le=0.05)
     tax_rate: float = Field(default=0.20315, ge=0.0, le=0.5)
     slippage_bps: float = Field(default=5.0, ge=0.0, le=200.0)
-    buy_score_threshold: float = Field(default=66.0, ge=30.0, le=95.0)
-    strong_buy_threshold: float = Field(default=76.0, ge=40.0, le=99.0)
-    sell_score_threshold: float = Field(default=30.0, ge=5.0, le=65.0)
-    take_profit_pct: float = Field(default=0.035, ge=0.003, le=0.5)
-    stop_loss_pct: float = Field(default=0.02, ge=0.003, le=0.5)
-    trailing_activation_pct: float = Field(default=0.015, ge=0.002, le=0.5)
-    trailing_stop_pct: float = Field(default=0.01, ge=0.002, le=0.5)
+    buy_score_threshold: float = Field(default=68.0, ge=30.0, le=95.0)
+    strong_buy_threshold: float = Field(default=78.0, ge=40.0, le=99.0)
+    sell_score_threshold: float = Field(default=25.0, ge=5.0, le=65.0)
+    take_profit_pct: float = Field(default=0.045, ge=0.003, le=0.5)
+    stop_loss_pct: float = Field(default=0.03, ge=0.003, le=0.5)
+    trailing_activation_pct: float = Field(default=0.02, ge=0.002, le=0.5)
+    trailing_stop_pct: float = Field(default=0.015, ge=0.002, le=0.5)
     close_before_eod: bool = Field(default=False)
+    ml_min_pred_return: float = Field(default=0.008, ge=0.001, le=0.1)
+    ml_horizon_bars: int = Field(default=8, ge=2, le=40)
+    max_hold_bars: int = Field(default=12, ge=0, le=100)
+    cooldown_bars: int = Field(default=6, ge=0, le=50)
 
 
 class PatternUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     enabled: bool | None = None
+    strategy_type: str | None = None
     initial_capital: float | None = Field(default=None, ge=1000.0, le=1000000000.0)
     unit_size: int | None = None
     watchlist_key: str | None = None
@@ -95,6 +101,10 @@ class PatternUpdateRequest(BaseModel):
     trailing_activation_pct: float | None = Field(default=None, ge=0.002, le=0.5)
     trailing_stop_pct: float | None = Field(default=None, ge=0.002, le=0.5)
     close_before_eod: bool | None = None
+    ml_min_pred_return: float | None = Field(default=None, ge=0.001, le=0.1)
+    ml_horizon_bars: int | None = Field(default=None, ge=2, le=40)
+    max_hold_bars: int | None = Field(default=None, ge=0, le=100)
+    cooldown_bars: int | None = Field(default=None, ge=0, le=50)
     reset_portfolio: bool = Field(default=False, description="初期資金変更時などにポートフォリオを初期化する")
 
 
@@ -147,6 +157,14 @@ def create_app(
     def get_dashboard() -> dict[str, Any]:
         cfg = _get_cfg()
         return storage.export_dashboard_snapshot(cfg)
+
+    @app.post("/api/ml/collect")
+    def collect_ml_data() -> dict[str, Any]:
+        cfg = _get_cfg()
+        sim = TradingSimulator(cfg, storage, provider=market_provider)
+        res = sim.collect_ml_data(intervals=("15m", "30m"), period_days=55)
+        snapshot = storage.export_dashboard_snapshot(cfg)
+        return {"ml": res, "dashboard": snapshot}
 
     # --- Multi-Pattern Management CRUD ---
     @app.get("/api/patterns")

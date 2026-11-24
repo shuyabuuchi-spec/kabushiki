@@ -225,6 +225,115 @@ def score_stock(
     )
 
 
+def score_stock_mean_reversion(
+    stock: StockInfo,
+    snap: IndicatorSnapshot,
+    cfg: AppConfig,
+) -> StockRecommendation:
+    """Mean-reversion (dip-buying) scorer calibrated for Japanese intraday equity behavior."""
+    score = 50.0
+    reasons: list[str] = []
+
+    dist_ema20 = ((snap.close - snap.ema20) / snap.ema20) if snap.ema20 else 0.0
+    dist_vwap = ((snap.close - snap.vwap) / snap.vwap) if snap.vwap else 0.0
+    bullish_candle = snap.close >= snap.open
+
+    # 1. Pullback below EMA20 / VWAP (avoid chasing overextended spikes!)
+    if -0.045 <= dist_ema20 <= -0.007:
+        score += 14.0
+        reasons.append(f"EMA20下方への押し目 ({dist_ema20*100:+.1f}%)")
+    elif -0.007 < dist_ema20 < 0.0:
+        score += 6.0
+    elif dist_ema20 >= 0.015:
+        score -= 14.0
+        reasons.append(f"EMA20上方乖離・高値掴み警戒 ({dist_ema20*100:+.1f}%)")
+
+    if -0.035 <= dist_vwap <= -0.005:
+        score += 8.0
+        reasons.append("VWAP下方の割安水準")
+    elif dist_vwap >= 0.015:
+        score -= 7.0
+
+    # 2. RSI oversold zone
+    if 20.0 <= snap.rsi14 <= 36.0:
+        score += 15.0
+        reasons.append(f"RSI売られ過ぎ圏 (RSI={snap.rsi14:.1f})")
+    elif 36.0 < snap.rsi14 <= 44.0:
+        score += 7.0
+        reasons.append(f"RSI押し目圏 (RSI={snap.rsi14:.1f})")
+    elif snap.rsi14 >= 68.0:
+        score -= 14.0
+        reasons.append(f"RSI過熱圏 (RSI={snap.rsi14:.1f})")
+
+    # 3. Bollinger Band lower touch
+    if snap.bb_pct_b <= 0.18:
+        score += 11.0
+        reasons.append("ボリンジャー下限付近で自律反発期待")
+    elif snap.bb_pct_b >= 0.90:
+        score -= 11.0
+        reasons.append("ボリンジャー上限付近・反落警戒")
+
+    # 4. Short-term pullback (ROC12 negative) + reversal confirmation candle
+    if snap.roc12 <= -0.015 and bullish_candle:
+        score += 10.0
+        reasons.append(f"調整後の反発陽線 (ROC12={snap.roc12*100:+.1f}%)")
+    elif snap.roc12 >= 0.025:
+        score -= 10.0
+        reasons.append(f"急騰後の過熱注意 (ROC12={snap.roc12*100:+.1f}%)")
+
+    # 5. Volume confirmation on reversal
+    if snap.volume_ratio >= 1.3 and bullish_candle:
+        score += 6.0
+        reasons.append(f"反発時の出来高増加 ({snap.volume_ratio:.1f}倍)")
+
+    score = max(0.0, min(100.0, round(score, 1)))
+
+    if score >= cfg.strong_buy_threshold:
+        action = "STRONG_BUY"
+        action_label = "押し目強い買い"
+    elif score >= cfg.buy_score_threshold:
+        action = "BUY"
+        action_label = "押し目買い推奨"
+    elif score <= cfg.sell_score_threshold:
+        action = "SELL"
+        action_label = "過熱売り警戒"
+    else:
+        action = "HOLD"
+        action_label = "押し目待ち"
+
+    entry = snap.close
+    target_price = _round_jpy(entry * (1.0 + max(cfg.take_profit_pct, 0.025)))
+    stop_loss_price = _round_jpy(max(1.0, entry * (1.0 - max(cfg.stop_loss_pct, 0.015))))
+    risk = max(entry - stop_loss_price, 0.01)
+    reward = max(target_price - entry, 0.0)
+
+    if not reasons:
+        reasons.append("押し目形成待ち（中立圏）")
+
+    return StockRecommendation(
+        symbol=stock.symbol,
+        name=stock.name,
+        sector=stock.sector,
+        timestamp=snap.timestamp,
+        price=_round_jpy(entry),
+        change_pct=round(snap.change_pct * 100.0, 2),
+        score=score,
+        action=action,
+        action_label=action_label,
+        reasons=reasons[:4],
+        suggested_entry=_round_jpy(entry),
+        target_price=target_price,
+        stop_loss_price=stop_loss_price,
+        risk_reward=round(reward / risk, 2),
+        rsi14=round(snap.rsi14, 1),
+        macd_hist=round(snap.macd_hist, 4),
+        vwap=_round_jpy(snap.vwap),
+        volume_ratio=round(snap.volume_ratio, 2),
+        bb_pct_b=round(snap.bb_pct_b, 2),
+        atr14=round(snap.atr14, 2),
+    )
+
+
 def evaluate_sell_timing(
     position: dict[str, Any],
     rec: StockRecommendation,

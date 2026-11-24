@@ -36,17 +36,18 @@ def test_dashboard_multi_pattern_crud_scan_and_compare_api(tmp_path: Path):
             assert r_home.status_code == 200
             assert "Kabushiki" in r_home.text
 
-            # Initial dashboard has 4 default parallel patterns
+            # Initial dashboard has 5 default parallel patterns (ML + Mean Reversion + Trend + Lot100 ML)
             r_dash = await client.get("/api/dashboard")
             assert r_dash.status_code == 200
             dash = r_dash.json()
-            assert len(dash["pattern_order"]) == 4
+            assert len(dash["pattern_order"]) == 5
 
-            # Create a custom 5th pattern with 300,000 JPY and 10m interval
+            # Create a custom 6th pattern with 300,000 JPY and 10m interval
             r_create = await client.post(
                 "/api/patterns",
                 json={
                     "name": "カスタム30万円・10分足",
+                    "strategy_type": "mean_reversion",
                     "initial_capital": 300000,
                     "interval": "10m",
                     "unit_size": 1,
@@ -62,13 +63,13 @@ def test_dashboard_multi_pattern_crud_scan_and_compare_api(tmp_path: Path):
             new_pid = created["id"]
             assert created["initial_capital"] == 300000.0
             assert created["interval"] == "10m"
-            assert len(r_create.json()["dashboard"]["pattern_order"]) == 5
+            assert len(r_create.json()["dashboard"]["pattern_order"]) == 6
 
             # Run parallel scan across ALL enabled patterns
             r_scan = await client.post("/api/scan", json={"mode": "all", "catchup": True, "days": 5})
             assert r_scan.status_code == 200
             scan_data = r_scan.json()
-            assert len(scan_data["results"]) == 5
+            assert len(scan_data["results"]) == 6
             assert scan_data["dashboard"]["patterns"][new_pid]["initial_capital"] == 300000.0
 
             # Run parallel compare backtest across ALL enabled patterns
@@ -79,8 +80,8 @@ def test_dashboard_multi_pattern_crud_scan_and_compare_api(tmp_path: Path):
             assert r_cmp.status_code == 200
             cmp_data = r_cmp.json()
             assert cmp_data["compare_mode"] is True
-            assert cmp_data["pattern_count"] == 5
-            assert len(cmp_data["results"]) == 5
+            assert cmp_data["pattern_count"] == 6
+            assert len(cmp_data["results"]) == 6
 
             # Update pattern initial capital to 500,000 JPY & reset
             r_upd = await client.put(
@@ -103,6 +104,6 @@ def test_dashboard_multi_pattern_crud_scan_and_compare_api(tmp_path: Path):
             r_del = await client.delete(f"/api/patterns/{new_pid}")
             assert r_del.status_code == 200
             assert new_pid not in r_del.json()["dashboard"]["patterns"]
-            assert len(r_del.json()["dashboard"]["pattern_order"]) == 4
+            assert len(r_del.json()["dashboard"]["pattern_order"]) == 5
 
     asyncio.run(_run())

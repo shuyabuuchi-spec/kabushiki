@@ -51,6 +51,21 @@
   <main class="container">
     <div id="toastArea" class="toast hidden"></div>
 
+    <!-- ML Training Data Accumulation & Model Accuracy Monitor -->
+    <section class="card" id="mlMonitorSection">
+      <div class="card-header">
+        <div>
+          <h2>🤖 機械学習データ蓄積＆Walk-Forward予測モデル精度</h2>
+          <p class="card-desc">毎回の日中足データ（東証銘柄＋日経平均 ^N225）を暗号化DBへ継続蓄積し、未来情報ゼロのWalk-Forward再学習で精度を自動向上します。</p>
+        </div>
+        <button id="btnCollectMl" class="btn btn-ghost btn-sm">📥 学習データ収集＆再学習</button>
+      </div>
+      <div class="bt-summary-grid" id="mlStatusCards">
+        <div class="bt-stat"><div class="bt-stat-label">蓄積バー総数</div><div class="bt-stat-val">--</div></div>
+      </div>
+      <div id="mlFeatureWeights" class="reason-list" style="margin-top:8px;"></div>
+    </section>
+
     <!-- Parallel Pattern Comparison Board -->
     <section class="card">
       <div class="card-header">
@@ -362,6 +377,14 @@
           </div>
         </label>
         <label>
+          <span>戦略タイプ（予測モデル）</span>
+          <select name="strategy_type" class="select-input">
+            <option value="ml_walkforward">🤖 Walk-Forward 機械学習 (Ridge回帰)</option>
+            <option value="mean_reversion">📉 押し目買い平均回帰ルール</option>
+            <option value="trend">📈 テクニカル順張りルール</option>
+          </select>
+        </label>
+        <label>
           <span>売買チェック間隔（タイミング）</span>
           <select name="interval" class="select-input">
             <option value="5m">5分間隔 (5m足)</option>
@@ -370,6 +393,18 @@
             <option value="30m">30分間隔 (30m足)</option>
             <option value="60m">60分間隔 (60m足)</option>
           </select>
+        </label>
+        <label>
+          <span>ML最低期待リターン閾値 (%, コスト超え厳選)</span>
+          <input name="ml_min_pred_return" type="number" min="0.1" max="5" step="0.1" class="text-input" />
+        </label>
+        <label>
+          <span>最大保有本数 (0=制限なし, 例: 12本=6時間)</span>
+          <input name="max_hold_bars" type="number" min="0" max="100" step="1" class="text-input" />
+        </label>
+        <label>
+          <span>損切り後クールダウン本数 (再エントリー禁止)</span>
+          <input name="cooldown_bars" type="number" min="0" max="50" step="1" class="text-input" />
         </label>
         <label>
           <span>取引単位</span>
