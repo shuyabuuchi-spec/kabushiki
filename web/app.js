@@ -94,7 +94,7 @@ async function ghApiFetch(path, options = {}) {
 }
 
 async function ghLoadRepoConfig() {
-  // Try data/user_config.json first, fallback to config/default_config.json
+  // Fetch user_config.json first; skip default_config.json when user_config.json is already complete!
   let sha = null;
   let cfgObj = null;
   const rUser = await ghApiFetch(`/contents/data/user_config.json?ref=${state.githubConfig.branch}`);
@@ -102,12 +102,21 @@ async function ghLoadRepoConfig() {
     const j = await rUser.json();
     sha = j.sha;
     cfgObj = JSON.parse(base64ToUtf8(j.content));
+    if (cfgObj && Array.isArray(cfgObj.patterns) && cfgObj.watchlists) {
+      return { cfg: cfgObj, sha };
+    }
   }
-  const rDef = await ghApiFetch(`/contents/config/default_config.json?ref=${state.githubConfig.branch}`);
-  if (!rDef.ok && !cfgObj) {
-    throw new Error(`リポジトリ設定の取得に失敗しました (HTTP ${rDef.status})`);
+
+  let defObj = state.cachedDefaultConfig || null;
+  if (!defObj) {
+    const rDef = await ghApiFetch(`/contents/config/default_config.json?ref=${state.githubConfig.branch}`);
+    if (!rDef.ok && !cfgObj) {
+      throw new Error(`リポジトリ設定の取得に失敗しました (HTTP ${rDef.status})`);
+    }
+    defObj = rDef.ok ? JSON.parse(base64ToUtf8((await rDef.json()).content)) : {};
+    state.cachedDefaultConfig = defObj;
   }
-  const defObj = rDef.ok ? JSON.parse(base64ToUtf8((await rDef.json()).content)) : {};
+
   const merged = { ...defObj, ...(cfgObj || {}) };
   if (!merged.patterns || !Array.isArray(merged.patterns)) merged.patterns = defObj.patterns || [];
   if (!merged.watchlists) merged.watchlists = defObj.watchlists || {};
@@ -1289,7 +1298,13 @@ async function savePatternForm(e) {
     payload.reset_portfolio = form.reset_portfolio.checked;
   }
 
-  // GitHub Pages direct-edit path (via GitHub Contents + Actions API)
+  const submitBtn = form.querySelector('button[type="submit"]');
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "⏳ 保存中...";
+  }
+
+  // GitHub Pages direct-edit path (via GitHub Contents + background Actions dispatch)
   if (!state.apiAvailable && state.githubConnected) {
     try {
       const { cfg, sha } = await ghLoadRepoConfig();
@@ -1311,12 +1326,8 @@ async function savePatternForm(e) {
         sha,
         pid ? `chore(config): update pattern ${savedPattern.id}` : `chore(config): add pattern ${savedPattern.id}`
       );
-      await ghDispatchMonitorWorkflow({
-        force_run: true,
-        reset_pattern: pid && payload.reset_portfolio ? pid : "",
-      });
 
-      // Optimistically reflect in UI immediately
+      // Immediately update UI and close modal without blocking on Actions dispatch
       if (state.dashboard && state.dashboard.patterns) {
         const prev = state.dashboard.patterns[savedPattern.id];
         state.dashboard.patterns[savedPattern.id] = {
@@ -1359,9 +1370,19 @@ async function savePatternForm(e) {
 
       document.getElementById("patternModal").classList.add("hidden");
       renderDashboard();
-      showToast(`GitHubへ「${savedPattern.name}」を保存し、自動シミュレーションを起動しました（約1〜2分後に最新結果が反映されます）。`);
+      showToast(`GitHubへ「${savedPattern.name}」を保存しました。バックグラウンドで自動シミュレーションを起動中...`);
+
+      ghDispatchMonitorWorkflow({
+        force_run: true,
+        reset_pattern: pid && payload.reset_portfolio ? pid : "",
+      }).catch((err) => showToast(`Actions自動起動エラー: ${err.message}`, true));
     } catch (err) {
       showToast(`GitHub保存エラー: ${err.message}`, true);
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "パターンを保存";
+      }
     }
     return;
   }
@@ -1383,6 +1404,11 @@ async function savePatternForm(e) {
     showToast(pid ? `パターン「${data.pattern.name}」を更新しました。` : `新規パターン「${data.pattern.name}」を追加しました。`);
   } catch (err) {
     showToast(`パターン保存エラー: ${err.message}`, true);
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "パターンを保存";
+    }
   }
 }
 
