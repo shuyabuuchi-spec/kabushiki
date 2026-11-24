@@ -25,7 +25,7 @@ def fetch_fred_series(series_code: str, lookback_years: int = 5) -> pd.DataFrame
     """Fetch daily historical macro data from St. Louis Fed (FRED) official public CSV."""
     cutoff = (datetime.now() - timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_code}&cosd={cutoff}"
-    resp = requests.get(url, timeout=20, headers={"User-Agent": "KabushikiML/2.0"})
+    resp = requests.get(url, timeout=8, headers={"User-Agent": "KabushikiML/2.0", "Connection": "close"})
     resp.raise_for_status()
     raw = pd.read_csv(io.StringIO(resp.text))
     if raw.empty or len(raw.columns) < 2:
@@ -37,6 +37,22 @@ def fetch_fred_series(series_code: str, lookback_years: int = 5) -> pd.DataFrame
     df = df.dropna(subset=["date", "value"])
     df = df[df["date"] >= cutoff].reset_index(drop=True)
     return df
+
+
+def _fetch_yahoo_daily_macro_fallback(yahoo_symbol: str, lookback_years: int = 5) -> pd.DataFrame:
+    """Fast fallback for daily macro series when FRED temporarily times out."""
+    try:
+        import yfinance as yf
+
+        hist = yf.Ticker(yahoo_symbol).history(period=f"{lookback_years}y", interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return pd.DataFrame(columns=["date", "value"])
+        dates = [idx.strftime("%Y-%m-%d") for idx in hist.index]
+        vals = pd.to_numeric(hist["Close"], errors="coerce")
+        df = pd.DataFrame({"date": dates, "value": vals.values}).dropna()
+        return df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["date", "value"])
 
 
 def fetch_frankfurter_usdjpy(lookback_years: int = 4) -> pd.DataFrame:
@@ -73,7 +89,7 @@ def fetch_all_external_macro(lookback_years: int = 5) -> dict[str, dict[str, Any
         except Exception as exc:  # pragma: no cover
             logger.warning("FRED fetch failed for %s: %s", fred_code, exc)
 
-    # Frankfurter ECB fallback / supplement for USD/JPY
+    # Frankfurter ECB fallback for USD/JPY
     if "FRED_USDJPY" not in collected or collected["FRED_USDJPY"]["df"].empty:
         try:
             fx_df = fetch_frankfurter_usdjpy(lookback_years=min(lookback_years, 4))
@@ -85,6 +101,19 @@ def fetch_all_external_macro(lookback_years: int = 5) -> dict[str, dict[str, Any
                 }
         except Exception as exc:  # pragma: no cover
             logger.warning("Frankfurter fetch failed: %s", exc)
+
+    # Secondary fast fallback via Yahoo daily macro tickers for any remaining missing macro series
+    yahoo_fallbacks = {
+        "FRED_USDJPY": ("USDJPY=X", "ドル円為替 (Yahoo日足補完)"),
+        "FRED_VIX": ("^VIX", "米国VIX恐怖指数 (Yahoo日足補完)"),
+        "FRED_US10Y": ("^TNX", "米国10年債利回り (Yahoo日足補完)"),
+        "FRED_NIKKEI": ("^N225", "日経225日足 (Yahoo日足補完)"),
+    }
+    for sid, (ysym, ylbl) in yahoo_fallbacks.items():
+        if sid not in collected or collected[sid]["df"].empty:
+            ydf = _fetch_yahoo_daily_macro_fallback(ysym, lookback_years=lookback_years)
+            if not ydf.empty:
+                collected[sid] = {"source": "Yahoo Macro (日足5年)", "label": ylbl, "df": ydf}
 
     return collected
 
