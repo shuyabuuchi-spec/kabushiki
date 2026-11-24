@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time as time_mod
 
-from .config import load_config, SUPPORTED_INTERVALS
+from .config import (
+    load_config,
+    SUPPORTED_INTERVALS,
+    DEFAULT_DB_PATH,
+    DEFAULT_SNAPSHOT_PATH,
+    WEB_SNAPSHOT_PATH,
+    PROJECT_ROOT,
+)
+from .crypto_utils import encrypt_file, decrypt_file
 from .market_data import is_tse_market_open, tse_market_status
 from .simulator import TradingSimulator
 from .storage import Storage
+
+ENC_DB_PATH = PROJECT_ROOT / "data" / "kabushiki.db.enc"
+ENC_WEB_SNAPSHOT_PATH = PROJECT_ROOT / "web" / "data" / "dashboard_snapshot.enc.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,6 +63,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="全パターンの現在のシミュレーション資産状況を一覧表示")
     sub.add_parser("patterns", help="登録されているシミュレーションパターン一覧を表示")
     sub.add_parser("export-snapshot", help="ダッシュボード用静的JSONスナップショットを再出力")
+
+    # encrypt-state / decrypt-state (uses DASHBOARD_PASSPHRASE env var)
+    p_enc = sub.add_parser("encrypt-state", help="DBとダッシュボードJSONをAES-256-GCMで暗号化")
+    p_enc.add_argument("--remove-plaintext", action="store_true", help="暗号化後に平文ファイルを削除")
+    sub.add_parser("decrypt-state", help="暗号化済みDB(kabushiki.db.enc)を復号")
 
     # reset
     p_reset = sub.add_parser("reset", help="シミュレーション資産を初期資金にリセット")
@@ -182,6 +199,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "export-snapshot":
         storage.export_dashboard_snapshot(cfg)
         print("Snapshot exported.")
+        return 0
+
+    if args.command == "encrypt-state":
+        passphrase = os.environ.get("DASHBOARD_PASSPHRASE", "").strip()
+        if not passphrase:
+            print("Error: DASHBOARD_PASSPHRASE environment variable is not set.", file=sys.stderr)
+            return 1
+        if not DEFAULT_SNAPSHOT_PATH.exists():
+            storage.export_dashboard_snapshot(cfg)
+        if DEFAULT_SNAPSHOT_PATH.exists():
+            encrypt_file(DEFAULT_SNAPSHOT_PATH, ENC_WEB_SNAPSHOT_PATH, passphrase)
+        if DEFAULT_DB_PATH.exists():
+            encrypt_file(DEFAULT_DB_PATH, ENC_DB_PATH, passphrase)
+        if args.remove_plaintext:
+            for p in (DEFAULT_DB_PATH, DEFAULT_SNAPSHOT_PATH, WEB_SNAPSHOT_PATH):
+                if p.exists():
+                    p.unlink()
+        print("Encrypted DB and dashboard snapshot successfully.")
+        return 0
+
+    if args.command == "decrypt-state":
+        passphrase = os.environ.get("DASHBOARD_PASSPHRASE", "").strip()
+        if not passphrase:
+            print("Error: DASHBOARD_PASSPHRASE environment variable is not set.", file=sys.stderr)
+            return 1
+        if ENC_DB_PATH.exists():
+            decrypt_file(ENC_DB_PATH, DEFAULT_DB_PATH, passphrase)
+            print("Decrypted DB restored.")
+        else:
+            print("No encrypted DB found; starting fresh or using existing DB.")
         return 0
 
     if args.command == "reset":

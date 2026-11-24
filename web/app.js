@@ -4,10 +4,89 @@ const SERIES_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#ec4899", "#a855f7", "#
 
 const state = {
   apiAvailable: false,
+  encryptedMode: false,
+  encryptedEnvelope: null,
   selectedPatternId: null,
   dashboard: null,
   lastCompareResults: [],
 };
+
+const SESSION_KEY = "kabushiki_unlock_pass";
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function decryptDashboardEnvelope(envelope, passphrase) {
+  if (!window.crypto || !window.crypto.subtle) {
+    throw new Error("このブラウザは Web Crypto API (HTTPS) に対応していません。");
+  }
+  const enc = new TextEncoder();
+  const salt = b64ToBytes(envelope.salt);
+  const iv = b64ToBytes(envelope.iv);
+  const ciphertext = b64ToBytes(envelope.ciphertext);
+  const iterations = Number(envelope.iterations || 310000);
+
+  const keyMaterial = await window.crypto.subtle.importKey(
+    "raw",
+    enc.encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  const aesKey = await window.crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+  const plainBuffer = await window.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    ciphertext
+  );
+  const jsonText = new TextDecoder().decode(plainBuffer);
+  return JSON.parse(jsonText);
+}
+
+function setStaticButtonsDisabled() {
+  ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest"].forEach(
+    (id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = true;
+    }
+  );
+}
+
+async function tryUnlockWithPassphrase(passphrase) {
+  if (!state.encryptedEnvelope) return false;
+  const decrypted = await decryptDashboardEnvelope(state.encryptedEnvelope, passphrase);
+  state.dashboard = decrypted;
+  sessionStorage.setItem(SESSION_KEY, passphrase);
+  document.getElementById("loginOverlay").classList.add("hidden");
+  document.getElementById("loginError").classList.add("hidden");
+  document.getElementById("btnLogout").classList.remove("hidden");
+  const connBadge = document.getElementById("connectionBadge");
+  connBadge.textContent = "🔒 暗号化ビューア（認証済み）";
+  connBadge.className = "pill pill-ok";
+  setStaticButtonsDisabled();
+  renderDashboard();
+  return true;
+}
+
+function handleLogout() {
+  sessionStorage.removeItem(SESSION_KEY);
+  state.dashboard = null;
+  document.getElementById("btnLogout").classList.add("hidden");
+  document.getElementById("loginPassphrase").value = "";
+  document.getElementById("loginError").classList.add("hidden");
+  document.getElementById("loginOverlay").classList.remove("hidden");
+  document.getElementById("loginPassphrase").focus();
+}
 
 const fmtJPY = (n) => "¥" + Math.round(Number(n || 0)).toLocaleString("ja-JP");
 const fmtPrice = (n) => "¥" + Number(n || 0).toLocaleString("ja-JP", { maximumFractionDigits: 1 });
@@ -526,18 +605,42 @@ async function loadDashboard() {
     state.apiAvailable = false;
   }
 
+  // 1. Check encrypted static snapshot first (GitHub Pages with DASHBOARD_PASSPHRASE)
+  try {
+    const encResp = await fetch("./data/dashboard_snapshot.enc.json", { cache: "no-store" });
+    if (encResp.ok) {
+      const envelope = await encResp.json();
+      if (envelope && envelope.encrypted) {
+        state.encryptedMode = true;
+        state.encryptedEnvelope = envelope;
+        const savedPass = sessionStorage.getItem(SESSION_KEY);
+        if (savedPass) {
+          try {
+            await tryUnlockWithPassphrase(savedPass);
+            return;
+          } catch {
+            sessionStorage.removeItem(SESSION_KEY);
+          }
+        }
+        connBadge.textContent = "🔒 暗号化ロック中";
+        connBadge.className = "pill pill-warn";
+        document.getElementById("loginOverlay").classList.remove("hidden");
+        document.getElementById("loginPassphrase").focus();
+        return;
+      }
+    }
+  } catch {
+    // No encrypted snapshot; fall through to plaintext static snapshot
+  }
+
+  // 2. Plaintext static snapshot fallback
   try {
     const resp = await fetch("./data/dashboard_snapshot.json", { cache: "no-store" });
     if (!resp.ok) throw new Error("Snapshot missing");
     state.dashboard = await resp.json();
     connBadge.textContent = "☁ 静的ビューアモード（GitHub Actions更新）";
     connBadge.className = "pill pill-warn";
-    ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest"].forEach(
-      (id) => {
-        const el = document.getElementById(id);
-        if (el) el.disabled = true;
-      }
-    );
+    setStaticButtonsDisabled();
     renderDashboard();
   } catch {
     connBadge.textContent = "🔴 データ未取得";
@@ -885,6 +988,26 @@ document.addEventListener("DOMContentLoaded", () => {
     btn.addEventListener("click", () => {
       document.getElementById("patternForm").initial_capital.value = btn.dataset.val;
     });
+  });
+
+  document.getElementById("btnLogout").addEventListener("click", handleLogout);
+  document.getElementById("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const passInput = document.getElementById("loginPassphrase");
+    const errEl = document.getElementById("loginError");
+    const btn = document.getElementById("btnUnlock");
+    btn.disabled = true;
+    btn.textContent = "⏳ 復号中...";
+    errEl.classList.add("hidden");
+    try {
+      await tryUnlockWithPassphrase(passInput.value);
+    } catch {
+      errEl.classList.remove("hidden");
+      passInput.select();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🔓 復号してログイン";
+    }
   });
 
   loadDashboard();

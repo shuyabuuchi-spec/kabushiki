@@ -38,6 +38,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Decrypt simulation DB if passphrase secret is configured
+        env:
+          DASHBOARD_PASSPHRASE: ${{ secrets.DASHBOARD_PASSPHRASE }}
+        run: |
+          if [ -n "$DASHBOARD_PASSPHRASE" ]; then
+            python -m kabushiki.runner decrypt-state
+          fi
+
       - name: Run parallel catch-up monitor & simulation for all enabled patterns
         env:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || 'false' }}
@@ -48,11 +56,21 @@ jobs:
             python -m kabushiki.runner catchup --pattern all --days 5 --only-when-open
           fi
 
-      - name: Commit updated simulation state & dashboard snapshot
+      - name: Encrypt state & commit updated simulation data
+        env:
+          DASHBOARD_PASSPHRASE: ${{ secrets.DASHBOARD_PASSPHRASE }}
         run: |
           git config user.name "kabushiki-bot"
           git config user.email "kabushiki-bot@users.noreply.github.com"
-          git add data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
+
+          if [ -n "$DASHBOARD_PASSPHRASE" ]; then
+            python -m kabushiki.runner encrypt-state --remove-plaintext
+            git rm -f --ignore-unmatch data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
+            git add data/kabushiki.db.enc web/data/dashboard_snapshot.enc.json
+          else
+            git add data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
+          fi
+
           if git diff --cached --quiet; then
             echo "No state changes to commit."
           else

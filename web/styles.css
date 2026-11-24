@@ -626,6 +626,81 @@ body {
   padding-top: 10px;
 }
 
+/* Login / AES-256-GCM Unlock Overlay */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: radial-gradient(circle at top, #13203d 0%, #070c17 75%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--surface);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 16px;
+  padding: 28px 24px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  text-align: center;
+}
+
+.login-icon {
+  font-size: 38px;
+  margin-bottom: 6px;
+}
+
+.login-card h2 {
+  margin: 0 0 8px;
+  font-size: 1.25rem;
+}
+
+.login-desc {
+  margin: 0 0 18px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+}
+
+.login-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.full-width {
+  width: 100%;
+  padding: 10px 16px;
+}
+
+.login-error {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.16);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  color: #fecaca;
+  font-size: 0.8rem;
+}
+
+.login-note {
+  margin: 14px 0 0;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
 /* Modal */
 .modal {
   position: fixed;

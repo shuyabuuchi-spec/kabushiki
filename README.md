@@ -53,7 +53,11 @@ python -m venv .venv
 1. **Public リポジトリ**として GitHub へプッシュします（APIキー・個人情報不要のため安全で、他の Private リポジトリの Actions 枠を消費しません）。
 2. `Settings → Actions → General → Workflow permissions` で **Read and write permissions** を有効にします。
 3. （任意）`Settings → Pages → Source` を **GitHub Actions** に設定すると、スマホ等から全パターンの最新比較ダッシュボードを常時閲覧できます。
-4. パターンを追加・変更した `data/user_config.json` をリポジトリにコミットしておけば、PC OFF 中の GitHub Actions でもその設定のまま並行稼働します。
+4. **ログイン画面（AES-256-GCM暗号化保護）を有効にする場合**:
+   - `Settings → Secrets and variables → Actions → Repository secrets → New repository secret`
+   - **Name**: `DASHBOARD_PASSPHRASE` / **Secret**: 任意のパスワード → **Add secret**
+   - `Actions` タブから `Monitor JP Stocks & Multi-Pattern Simulator (PC OFF)` を1回実行すると、DBとJSONが自動暗号化され、GitHub Pages にログイン画面が表示されます（コード・リポジトリ内にパスワード平文は一切保存されません）。
+5. パターンを追加・変更した `data/user_config.json` をリポジトリにコミットしておけば、PC OFF 中の GitHub Actions でもその設定のまま並行稼働します。
 
 ---
 

@@ -7,6 +7,24 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- Encrypted Login / Unlock Overlay (shown automatically on GitHub Pages when encrypted snapshot exists) -->
+  <div id="loginOverlay" class="login-overlay hidden" role="dialog" aria-modal="true" aria-label="Kabushiki ログイン">
+    <div class="login-card">
+      <div class="login-icon">🔒</div>
+      <h2>Kabushiki ログイン</h2>
+      <p class="login-desc">このダッシュボードのデータは <b>AES-256-GCM</b> で暗号化されています。<br/>GitHub Secrets（<code>DASHBOARD_PASSPHRASE</code>）に登録したパスワードを入力すると、ブラウザ内で復号して表示します。</p>
+      <form id="loginForm" class="login-form">
+        <label>
+          <span>パスワード</span>
+          <input id="loginPassphrase" type="password" autocomplete="current-password" required class="text-input" placeholder="パスフレーズを入力..." />
+        </label>
+        <div id="loginError" class="login-error hidden">パスワードが正しくないため復号できませんでした。</div>
+        <button type="submit" id="btnUnlock" class="btn btn-primary full-width">🔓 復号してログイン</button>
+      </form>
+      <p class="login-note">※ パスワードはサーバーへ送信されず、現在のタブ内のみで利用されます。</p>
+    </div>
+  </div>
+
   <header class="topbar">
     <div class="topbar-left">
       <div class="brand">
@@ -25,6 +43,7 @@
           ⚡ 全パターン最新スキャン＆補完
         </button>
         <button id="btnAddPatternTop" class="btn btn-accent">＋ パターン追加</button>
+        <button id="btnLogout" class="btn btn-danger-ghost hidden" title="セッションをロックしてログイン画面に戻る">🔒 ログアウト</button>
       </div>
     </div>
   </header>
