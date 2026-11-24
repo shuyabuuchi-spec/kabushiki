@@ -24,7 +24,7 @@ FRED_MACRO_SERIES = {
 def fetch_fred_series(series_code: str, lookback_years: int = 5) -> pd.DataFrame:
     """Fetch daily historical macro data from St. Louis Fed (FRED) official public CSV."""
     cutoff = (datetime.now() - timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_code}&cosd={cutoff}"
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_code}"
     resp = requests.get(url, timeout=8, headers={"User-Agent": "KabushikiML/2.0", "Connection": "close"})
     resp.raise_for_status()
     raw = pd.read_csv(io.StringIO(resp.text))
