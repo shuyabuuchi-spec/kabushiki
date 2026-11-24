@@ -93,8 +93,13 @@ async function ghApiFetch(path, options = {}) {
   return resp;
 }
 
-async function ghLoadRepoConfig() {
-  // Fetch user_config.json first; skip default_config.json when user_config.json is already complete!
+async function ghLoadRepoConfig(forceRefresh = false) {
+  if (!forceRefresh && state.cachedRepoConfig && state.cachedRepoConfig.cfg) {
+    return {
+      cfg: JSON.parse(JSON.stringify(state.cachedRepoConfig.cfg)),
+      sha: state.cachedRepoConfig.sha,
+    };
+  }
   let sha = null;
   let cfgObj = null;
   const rUser = await ghApiFetch(`/contents/data/user_config.json?ref=${state.githubConfig.branch}`);
@@ -103,6 +108,7 @@ async function ghLoadRepoConfig() {
     sha = j.sha;
     cfgObj = JSON.parse(base64ToUtf8(j.content));
     if (cfgObj && Array.isArray(cfgObj.patterns) && cfgObj.watchlists) {
+      state.cachedRepoConfig = { cfg: JSON.parse(JSON.stringify(cfgObj)), sha };
       return { cfg: cfgObj, sha };
     }
   }
@@ -120,10 +126,11 @@ async function ghLoadRepoConfig() {
   const merged = { ...defObj, ...(cfgObj || {}) };
   if (!merged.patterns || !Array.isArray(merged.patterns)) merged.patterns = defObj.patterns || [];
   if (!merged.watchlists) merged.watchlists = defObj.watchlists || {};
+  state.cachedRepoConfig = { cfg: JSON.parse(JSON.stringify(merged)), sha };
   return { cfg: merged, sha };
 }
 
-async function ghSaveRepoConfig(cfgObj, sha, commitMessage) {
+async function ghSaveRepoConfig(cfgObj, sha, commitMessage, _retried = false) {
   const body = {
     message: commitMessage,
     content: utf8ToBase64(JSON.stringify(cfgObj, null, 2) + "\n"),
@@ -134,11 +141,20 @@ async function ghSaveRepoConfig(cfgObj, sha, commitMessage) {
     method: "PUT",
     body: JSON.stringify(body),
   });
+  if (resp.status === 409 && !_retried) {
+    // Stale sha cached; refresh latest sha once and retry transparently
+    const fresh = await ghLoadRepoConfig(true);
+    return ghSaveRepoConfig(cfgObj, fresh.sha, commitMessage, true);
+  }
   if (!resp.ok) {
+    state.cachedRepoConfig = null;
     const err = await resp.json().catch(() => ({}));
     throw new Error(err.message || `GitHub保存失敗 (HTTP ${resp.status})`);
   }
-  return await resp.json();
+  const resJson = await resp.json();
+  const newSha = resJson && resJson.content ? resJson.content.sha : sha;
+  state.cachedRepoConfig = { cfg: JSON.parse(JSON.stringify(cfgObj)), sha: newSha };
+  return resJson;
 }
 
 async function ghDispatchMonitorWorkflow(inputs = {}) {
@@ -1417,20 +1433,31 @@ async function togglePatternEnabled(pid) {
   const target = list.find((p) => (p.pattern_id || p.mode) === pid);
   if (!target) return;
   if (!state.apiAvailable && state.githubConnected) {
+    const nextEnabled = !target.enabled;
+    // Optimistic instant UI update
+    if (state.dashboard && state.dashboard.patterns && state.dashboard.patterns[pid]) {
+      state.dashboard.patterns[pid].enabled = nextEnabled;
+      if (state.dashboard.patterns[pid].pattern) state.dashboard.patterns[pid].pattern.enabled = nextEnabled;
+    }
+    renderDashboard();
+    showToast(`⏳ 「${target.mode_label}」を${nextEnabled ? "稼働中" : "停止"}へ更新中...`);
     try {
       const { cfg, sha } = await ghLoadRepoConfig();
       const item = cfg.patterns.find((p) => p.id === pid);
       if (!item) throw new Error("対象パターンが見つかりません");
-      item.enabled = !target.enabled;
+      item.enabled = nextEnabled;
       await ghSaveRepoConfig(cfg, sha, `chore(config): toggle pattern ${pid}`);
-      await ghDispatchMonitorWorkflow({ force_run: true });
+      showToast(`GitHub設定を更新：「${target.mode_label}」を${nextEnabled ? "稼働中" : "停止"}に変更しました。`);
+      ghDispatchMonitorWorkflow({ force_run: true }).catch((err) =>
+        showToast(`Actions起動エラー: ${err.message}`, true)
+      );
+    } catch (err) {
+      // Revert optimistic update on error
       if (state.dashboard && state.dashboard.patterns && state.dashboard.patterns[pid]) {
-        state.dashboard.patterns[pid].enabled = item.enabled;
-        if (state.dashboard.patterns[pid].pattern) state.dashboard.patterns[pid].pattern.enabled = item.enabled;
+        state.dashboard.patterns[pid].enabled = !nextEnabled;
+        if (state.dashboard.patterns[pid].pattern) state.dashboard.patterns[pid].pattern.enabled = !nextEnabled;
       }
       renderDashboard();
-      showToast(`GitHub設定を更新：「${target.mode_label}」を${item.enabled ? "稼働中" : "停止"}に変更しました。`);
-    } catch (err) {
       showToast(`GitHub更新エラー: ${err.message}`, true);
     }
     return;
@@ -1457,20 +1484,36 @@ async function deletePattern(pid) {
   if (!target) return;
   if (!confirm(`パターン「${target.mode_label}」とそのシミュレーション履歴を削除しますか？`)) return;
   if (!state.apiAvailable && state.githubConnected) {
+    if (list.length <= 1) {
+      showToast("最低1つのパターンを残す必要があります。", true);
+      return;
+    }
+    // Optimistic instant UI removal (0ms!)
+    const prevPatterns = { ...(state.dashboard.patterns || {}) };
+    const prevOrder = [...(state.dashboard.pattern_order || [])];
+    const prevSelected = state.selectedPatternId;
+
+    delete state.dashboard.patterns[pid];
+    state.dashboard.pattern_order = prevOrder.filter((id) => id !== pid);
+    if (state.selectedPatternId === pid) state.selectedPatternId = null;
+    renderDashboard();
+    showToast(`⏳ 「${target.mode_label}」をGitHubから削除中...`);
+
     try {
       const { cfg, sha } = await ghLoadRepoConfig();
       if (cfg.patterns.length <= 1) throw new Error("最低1つのパターンを残す必要があります");
       cfg.patterns = cfg.patterns.filter((p) => p.id !== pid);
       await ghSaveRepoConfig(cfg, sha, `chore(config): delete pattern ${pid}`);
-      await ghDispatchMonitorWorkflow({ force_run: true });
-      if (state.dashboard && state.dashboard.patterns) {
-        delete state.dashboard.patterns[pid];
-        state.dashboard.pattern_order = (state.dashboard.pattern_order || []).filter((id) => id !== pid);
-      }
-      if (state.selectedPatternId === pid) state.selectedPatternId = null;
-      renderDashboard();
-      showToast(`GitHubから「${target.mode_label}」を削除し、スナップショット更新を起動しました。`);
+      showToast(`GitHubから「${target.mode_label}」を削除しました（バックグラウンドでスナップショット更新中）。`);
+      ghDispatchMonitorWorkflow({ force_run: true }).catch((err) =>
+        showToast(`Actions起動エラー: ${err.message}`, true)
+      );
     } catch (err) {
+      // Revert optimistic removal on failure
+      state.dashboard.patterns = prevPatterns;
+      state.dashboard.pattern_order = prevOrder;
+      state.selectedPatternId = prevSelected;
+      renderDashboard();
       showToast(`GitHub削除エラー: ${err.message}`, true);
     }
     return;
@@ -1503,6 +1546,7 @@ async function handleResetSelected() {
     return;
   }
   if (!state.apiAvailable && state.githubConnected) {
+    showToast(`⏳ 「${p.mode_label}」の初期資金を ${fmtJPY(newCap)} に更新中...`);
     try {
       const { cfg, sha } = await ghLoadRepoConfig();
       const item = cfg.patterns.find((x) => x.id === pid);
@@ -1510,8 +1554,15 @@ async function handleResetSelected() {
         item.initial_capital = newCap;
         await ghSaveRepoConfig(cfg, sha, `chore(config): reset capital of ${pid} to ${newCap}`);
       }
-      await ghDispatchMonitorWorkflow({ force_run: true, reset_pattern: pid });
-      showToast(`「${p.mode_label}」を元手 ${fmtJPY(newCap)} でリセットするよう GitHub Actions を起動しました（約1〜2分後に反映）。`);
+      if (state.dashboard && state.dashboard.patterns && state.dashboard.patterns[pid]) {
+        state.dashboard.patterns[pid].initial_capital = newCap;
+        if (state.dashboard.patterns[pid].pattern) state.dashboard.patterns[pid].pattern.initial_capital = newCap;
+        renderDashboard();
+      }
+      showToast(`「${p.mode_label}」を元手 ${fmtJPY(newCap)} でリセット依頼しました（バックグラウンドでActions実行中）。`);
+      ghDispatchMonitorWorkflow({ force_run: true, reset_pattern: pid }).catch((err) =>
+        showToast(`Actions起動エラー: ${err.message}`, true)
+      );
     } catch (err) {
       showToast(`GitHubリセットエラー: ${err.message}`, true);
     }
