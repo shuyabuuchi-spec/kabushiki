@@ -1,0 +1,348 @@
+{
+  "initial_capital": 100000,
+  "interval": "30m",
+  "default_mode": "lot1",
+  "max_positions": 3,
+  "max_allocation_pct": 0.4,
+  "fee_rate": 0.001,
+  "tax_rate": 0.20315,
+  "slippage_bps": 5,
+  "buy_score_threshold": 66,
+  "strong_buy_threshold": 76,
+  "sell_score_threshold": 30,
+  "take_profit_pct": 0.045,
+  "stop_loss_pct": 0.03,
+  "trailing_activation_pct": 0.02,
+  "trailing_stop_pct": 0.012,
+  "close_before_eod": false,
+  "patterns": [
+    {
+      "id": "p_ml_100k_30m",
+      "name": "🤖 機械学習 Walk-Forward 10万円（1株・30分足）",
+      "description": "過去蓄積データからオンライン再学習し、期待リターン+0.8%以上のみ厳選購入。損切りクールダウン＆時間軸決済あり",
+      "enabled": true,
+      "strategy_type": "ml_walkforward",
+      "initial_capital": 100000,
+      "unit_size": 1,
+      "watchlist_key": "lot1",
+      "interval": "30m",
+      "max_positions": 3,
+      "max_allocation_pct": 0.45,
+      "fee_rate": 0.001,
+      "tax_rate": 0.20315,
+      "slippage_bps": 5,
+      "buy_score_threshold": 70,
+      "strong_buy_threshold": 80,
+      "sell_score_threshold": 25,
+      "take_profit_pct": 0.045,
+      "stop_loss_pct": 0.03,
+      "trailing_activation_pct": 0.02,
+      "trailing_stop_pct": 0.015,
+      "close_before_eod": false,
+      "ml_min_pred_return": 0.008,
+      "ml_horizon_bars": 8,
+      "max_hold_bars": 12,
+      "cooldown_bars": 6
+    },
+    {
+      "id": "p_ml_100k_15m",
+      "name": "🤖 機械学習 Walk-Forward 10万円（1株・15分足）",
+      "description": "15分足でWalk-Forward再学習。期待リターン+0.7%以上のみ厳選して高値掴みを回避",
+      "enabled": true,
+      "strategy_type": "ml_walkforward",
+      "initial_capital": 100000,
+      "unit_size": 1,
+      "watchlist_key": "lot1",
+      "interval": "15m",
+      "max_positions": 3,
+      "max_allocation_pct": 0.45,
+      "fee_rate": 0.001,
+      "tax_rate": 0.20315,
+      "slippage_bps": 5,
+      "buy_score_threshold": 70,
+      "strong_buy_threshold": 80,
+      "sell_score_threshold": 25,
+      "take_profit_pct": 0.04,
+      "stop_loss_pct": 0.025,
+      "trailing_activation_pct": 0.018,
+      "trailing_stop_pct": 0.012,
+      "close_before_eod": false,
+      "ml_min_pred_return": 0.007,
+      "ml_horizon_bars": 12,
+      "max_hold_bars": 18,
+      "cooldown_bars": 8
+    },
+    {
+      "id": "p_reversion_100k_30m",
+      "name": "📉 押し目買い平均回帰 10万円（1株・30分足）",
+      "description": "日本株日中足の平均回帰特性を活用。EMA20下方乖離・RSI売られ過ぎからの反発を狙い底値狼狽売りを抑制",
+      "enabled": true,
+      "strategy_type": "mean_reversion",
+      "initial_capital": 100000,
+      "unit_size": 1,
+      "watchlist_key": "lot1",
+      "interval": "30m",
+      "max_positions": 3,
+      "max_allocation_pct": 0.45,
+      "fee_rate": 0.001,
+      "tax_rate": 0.20315,
+      "slippage_bps": 5,
+      "buy_score_threshold": 68,
+      "strong_buy_threshold": 78,
+      "sell_score_threshold": 22,
+      "take_profit_pct": 0.04,
+      "stop_loss_pct": 0.025,
+      "trailing_activation_pct": 0.018,
+      "trailing_stop_pct": 0.012,
+      "close_before_eod": false,
+      "ml_min_pred_return": 0.008,
+      "ml_horizon_bars": 8,
+      "max_hold_bars": 14,
+      "cooldown_bars": 6
+    },
+    {
+      "id": "p_100k_15m_balanced",
+      "name": "📈 順張りバランス 10万円（1株・15分足・比較用）",
+      "description": "従来のテクニカル順張りルール（ML・押し目戦略との比較ベンチマーク用）",
+      "enabled": true,
+      "strategy_type": "trend",
+      "initial_capital": 100000,
+      "unit_size": 1,
+      "watchlist_key": "lot1",
+      "interval": "15m",
+      "max_positions": 3,
+      "max_allocation_pct": 0.4,
+      "fee_rate": 0.001,
+      "tax_rate": 0.20315,
+      "slippage_bps": 5,
+      "buy_score_threshold": 68,
+      "strong_buy_threshold": 78,
+      "sell_score_threshold": 28,
+      "take_profit_pct": 0.035,
+      "stop_loss_pct": 0.02,
+      "trailing_activation_pct": 0.015,
+      "trailing_stop_pct": 0.01,
+      "close_before_eod": false,
+      "ml_min_pred_return": 0.008,
+      "ml_horizon_bars": 8,
+      "max_hold_bars": 0,
+      "cooldown_bars": 4
+    },
+    {
+      "id": "p_100k_30m_lot100_ml",
+      "name": "🏢 単元株 ML 10万円（100株・30分足・ゼロ革命想定）",
+      "description": "100株単元・手数料0%（SBI/楽天ゼロコース想定）で株価1,000円以下銘柄をML厳選運用",
+      "enabled": true,
+      "strategy_type": "ml_walkforward",
+      "initial_capital": 100000,
+      "unit_size": 100,
+      "watchlist_key": "lot100",
+      "interval": "30m",
+      "max_positions": 3,
+      "max_allocation_pct": 0.5,
+      "fee_rate": 0,
+      "tax_rate": 0.20315,
+      "slippage_bps": 5,
+      "buy_score_threshold": 70,
+      "strong_buy_threshold": 80,
+      "sell_score_threshold": 25,
+      "take_profit_pct": 0.045,
+      "stop_loss_pct": 0.03,
+      "trailing_activation_pct": 0.02,
+      "trailing_stop_pct": 0.015,
+      "close_before_eod": false,
+      "ml_min_pred_return": 0.007,
+      "ml_horizon_bars": 8,
+      "max_hold_bars": 12,
+      "cooldown_bars": 6
+    },
+    {
+      "id": "p_ml_30_30",
+      "name": "🤖 MLカスタム 30万円（30分足）",
+      "description": "TEST",
+      "strategy_type": "ml_walkforward",
+      "initial_capital": 100000,
+      "interval": "30m",
+      "ml_min_pred_return": 0.008,
+      "max_hold_bars": 12,
+      "cooldown_bars": 6,
+      "unit_size": 1,
+      "watchlist_key": "lot1",
+      "max_positions": 3,
+      "max_allocation_pct": 0.4,
+      "buy_score_threshold": 66,
+      "strong_buy_threshold": 76,
+      "sell_score_threshold": 30,
+      "take_profit_pct": 0.035,
+      "stop_loss_pct": 0.02,
+      "trailing_activation_pct": 0.015,
+      "trailing_stop_pct": 0.01,
+      "fee_rate": 0.001,
+      "tax_rate": 0.20315000000000003,
+      "slippage_bps": 5,
+      "close_before_eod": true,
+      "enabled": true
+    }
+  ],
+  "watchlists": {
+    "lot1": [
+      {
+        "symbol": "7203.T",
+        "name": "トヨタ自動車",
+        "sector": "輸送用機器"
+      },
+      {
+        "symbol": "6758.T",
+        "name": "ソニーグループ",
+        "sector": "電気機器"
+      },
+      {
+        "symbol": "8306.T",
+        "name": "三菱UFJフィナンシャルG",
+        "sector": "銀行業"
+      },
+      {
+        "symbol": "9984.T",
+        "name": "ソフトバンクグループ",
+        "sector": "情報・通信"
+      },
+      {
+        "symbol": "8035.T",
+        "name": "東京エレクトロン",
+        "sector": "電気機器"
+      },
+      {
+        "symbol": "7974.T",
+        "name": "任天堂",
+        "sector": "その他製品"
+      },
+      {
+        "symbol": "6501.T",
+        "name": "日立製作所",
+        "sector": "電気機器"
+      },
+      {
+        "symbol": "8058.T",
+        "name": "三菱商事",
+        "sector": "卸売業"
+      },
+      {
+        "symbol": "9433.T",
+        "name": "KDDI",
+        "sector": "情報・通信"
+      },
+      {
+        "symbol": "7011.T",
+        "name": "三菱重工業",
+        "sector": "機械"
+      },
+      {
+        "symbol": "6702.T",
+        "name": "富士通",
+        "sector": "電気機器"
+      },
+      {
+        "symbol": "6098.T",
+        "name": "リクルートHD",
+        "sector": "サービス業"
+      },
+      {
+        "symbol": "8766.T",
+        "name": "東京海上HD",
+        "sector": "保険業"
+      },
+      {
+        "symbol": "4063.T",
+        "name": "信越化学工業",
+        "sector": "化学"
+      },
+      {
+        "symbol": "4502.T",
+        "name": "武田薬品工業",
+        "sector": "医薬品"
+      },
+      {
+        "symbol": "6902.T",
+        "name": "デンソー",
+        "sector": "輸送用機器"
+      },
+      {
+        "symbol": "4661.T",
+        "name": "オリエンタルランド",
+        "sector": "サービス業"
+      },
+      {
+        "symbol": "9434.T",
+        "name": "ソフトバンク",
+        "sector": "情報・通信"
+      }
+    ],
+    "lot100": [
+      {
+        "symbol": "9434.T",
+        "name": "ソフトバンク",
+        "sector": "情報・通信"
+      },
+      {
+        "symbol": "4689.T",
+        "name": "LINEヤフー",
+        "sector": "情報・通信"
+      },
+      {
+        "symbol": "7201.T",
+        "name": "日産自動車",
+        "sector": "輸送用機器"
+      },
+      {
+        "symbol": "7211.T",
+        "name": "三菱自動車工業",
+        "sector": "輸送用機器"
+      },
+      {
+        "symbol": "4755.T",
+        "name": "楽天グループ",
+        "sector": "サービス業"
+      },
+      {
+        "symbol": "8410.T",
+        "name": "セブン銀行",
+        "sector": "銀行業"
+      },
+      {
+        "symbol": "5020.T",
+        "name": "ENEOS HD",
+        "sector": "石油・石炭"
+      },
+      {
+        "symbol": "9501.T",
+        "name": "東京電力HD",
+        "sector": "電気・ガス"
+      },
+      {
+        "symbol": "2181.T",
+        "name": "パーソルHD",
+        "sector": "サービス業"
+      },
+      {
+        "symbol": "4005.T",
+        "name": "住友化学",
+        "sector": "化学"
+      },
+      {
+        "symbol": "3402.T",
+        "name": "東レ",
+        "sector": "繊維製品"
+      },
+      {
+        "symbol": "8604.T",
+        "name": "野村HD",
+        "sector": "証券・商品"
+      },
+      {
+        "symbol": "8593.T",
+        "name": "三菱HCキャピタル",
+        "sector": "その他金融"
+      }
+    ]
+  }
+}
