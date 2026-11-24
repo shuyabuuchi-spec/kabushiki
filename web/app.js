@@ -1,0 +1,891 @@
+/* Kabushiki Multi-Pattern Parallel Dashboard (live FastAPI + static GitHub Pages viewer) */
+
+const SERIES_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#ec4899", "#a855f7", "#14b8a6", "#f97316", "#eab308"];
+
+const state = {
+  apiAvailable: false,
+  selectedPatternId: null,
+  dashboard: null,
+  lastCompareResults: [],
+};
+
+const fmtJPY = (n) => "¥" + Math.round(Number(n || 0)).toLocaleString("ja-JP");
+const fmtPrice = (n) => "¥" + Number(n || 0).toLocaleString("ja-JP", { maximumFractionDigits: 1 });
+const fmtSignedJPY = (n) => {
+  const num = Number(n || 0);
+  return `${num > 0 ? "+" : ""}¥${Math.round(num).toLocaleString("ja-JP")}`;
+};
+const fmtPct = (n) => {
+  const num = Number(n || 0);
+  return `${num > 0 ? "+" : ""}${num.toFixed(2)}%`;
+};
+const fmtTime = (iso) => {
+  if (!iso) return "--";
+  try {
+    return new Date(iso).toLocaleString("ja-JP", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "Asia/Tokyo",
+    });
+  } catch {
+    return iso;
+  }
+};
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function showToast(msg, isError = false) {
+  const el = document.getElementById("toastArea");
+  el.textContent = msg;
+  el.classList.remove("hidden", "error");
+  if (isError) el.classList.add("error");
+  clearTimeout(showToast._timer);
+  showToast._timer = setTimeout(() => el.classList.add("hidden"), 6500);
+}
+
+function getPatternList() {
+  const dash = state.dashboard;
+  if (!dash) return [];
+  if (dash.patterns && dash.pattern_order) {
+    return dash.pattern_order.map((id) => dash.patterns[id]).filter(Boolean);
+  }
+  if (dash.modes) {
+    return Object.values(dash.modes);
+  }
+  return [];
+}
+
+function getSelectedPatternData() {
+  const list = getPatternList();
+  if (list.length === 0) return null;
+  if (state.selectedPatternId) {
+    const found = list.find((p) => (p.pattern_id || p.mode) === state.selectedPatternId);
+    if (found) return found;
+  }
+  state.selectedPatternId = list[0].pattern_id || list[0].mode;
+  return list[0];
+}
+
+function renderEquitySVG(containerId, points, initialCapital = 100000) {
+  const box = document.getElementById(containerId);
+  if (!points || points.length === 0) {
+    box.innerHTML = `<div class="empty-state">資産推移データはまだありません。スキャンまたはバックテストを実行してください。</div>`;
+    return;
+  }
+
+  const width = 760;
+  const height = 250;
+  const pad = { top: 20, right: 20, bottom: 32, left: 72 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+
+  const values = points.map((p) => Number(p.total_equity));
+  const minVal = Math.min(...values, initialCapital) * 0.998;
+  const maxVal = Math.max(...values, initialCapital) * 1.002;
+  const range = Math.max(maxVal - minVal, 100);
+
+  const xAt = (i) => (points.length === 1 ? pad.left + plotW / 2 : pad.left + (i / (points.length - 1)) * plotW);
+  const yAt = (v) => pad.top + plotH - ((v - minVal) / range) * plotH;
+
+  const lineCoords = points.map((p, i) => `${xAt(i).toFixed(1)},${yAt(Number(p.total_equity)).toFixed(1)}`);
+  const areaPath =
+    `M ${xAt(0).toFixed(1)},${(pad.top + plotH).toFixed(1)} ` +
+    points.map((p, i) => `L ${xAt(i).toFixed(1)},${yAt(Number(p.total_equity)).toFixed(1)}`).join(" ") +
+    ` L ${xAt(points.length - 1).toFixed(1)},${(pad.top + plotH).toFixed(1)} Z`;
+
+  const lastVal = values[values.length - 1];
+  const strokeColor = lastVal >= initialCapital ? "#22c55e" : "#ef4444";
+  const gradId = `eqGrad_${containerId}`;
+  const baseY = yAt(initialCapital);
+
+  let gridSvg = "";
+  for (let i = 0; i <= 4; i++) {
+    const val = minVal + (range * i) / 4;
+    const y = yAt(val);
+    gridSvg += `
+      <line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${width - pad.right}" y2="${y.toFixed(1)}" stroke="#1e2d4a" stroke-width="1" />
+      <text x="${pad.left - 8}" y="${(y + 4).toFixed(1)}" fill="#8ea0be" font-size="11" text-anchor="end">¥${Math.round(val).toLocaleString("ja-JP")}</text>
+    `;
+  }
+
+  const labelIndices = Array.from(new Set([0, Math.floor(points.length / 2), points.length - 1]));
+  const xLabels = labelIndices
+    .map((idx) => {
+      const anchor = idx === 0 ? "start" : idx === points.length - 1 ? "end" : "middle";
+      return `<text x="${xAt(idx).toFixed(1)}" y="${height - 8}" fill="#8ea0be" font-size="11" text-anchor="${anchor}">${escapeHtml(fmtTime(points[idx].timestamp))}</text>`;
+    })
+    .join("");
+
+  box.innerHTML = `
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="資産推移チャート">
+      <defs>
+        <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${strokeColor}" stop-opacity="0.32" />
+          <stop offset="100%" stop-color="${strokeColor}" stop-opacity="0.01" />
+        </linearGradient>
+      </defs>
+      ${gridSvg}
+      <line x1="${pad.left}" y1="${baseY.toFixed(1)}" x2="${width - pad.right}" y2="${baseY.toFixed(1)}"
+            stroke="#60a5fa" stroke-width="1.2" stroke-dasharray="5,4" />
+      <text x="${width - pad.right}" y="${(baseY - 5).toFixed(1)}" fill="#93c5fd" font-size="10" text-anchor="end">元手 ${fmtJPY(initialCapital)}</text>
+      <path d="${areaPath}" fill="url(#${gradId})" />
+      <polyline points="${lineCoords.join(" ")}" fill="none" stroke="${strokeColor}" stroke-width="2.4" stroke-linejoin="round" />
+      <circle cx="${xAt(points.length - 1).toFixed(1)}" cy="${yAt(lastVal).toFixed(1)}" r="4.5" fill="${strokeColor}" stroke="#fff" stroke-width="1.5" />
+      ${xLabels}
+    </svg>
+  `;
+}
+
+function renderMultiCompareSVG(containerId, results) {
+  const box = document.getElementById(containerId);
+  if (!results || results.length === 0) {
+    box.innerHTML = `<div class="empty-state">比較データがありません。</div>`;
+    return;
+  }
+
+  const width = 920;
+  const height = 250;
+  const pad = { top: 18, right: 20, bottom: 30, left: 58 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+
+  let minRet = 0;
+  let maxRet = 0;
+  let minTs = Infinity;
+  let maxTs = -Infinity;
+
+  results.forEach((r) => {
+    (r.equity_curve || []).forEach((pt) => {
+      const ret = Number(pt.return_pct || 0);
+      const t = new Date(pt.timestamp).getTime();
+      if (ret < minRet) minRet = ret;
+      if (ret > maxRet) maxRet = ret;
+      if (t < minTs) minTs = t;
+      if (t > maxTs) maxTs = t;
+    });
+  });
+
+  minRet = Math.min(minRet - 0.5, -0.5);
+  maxRet = Math.max(maxRet + 0.5, 0.5);
+  const retRange = Math.max(maxRet - minRet, 1.0);
+  const tsRange = Math.max(maxTs - minTs, 1);
+
+  const xAt = (ts) => pad.left + ((ts - minTs) / tsRange) * plotW;
+  const yAt = (ret) => pad.top + plotH - ((ret - minRet) / retRange) * plotH;
+
+  let gridSvg = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = minRet + (retRange * i) / 4;
+    const y = yAt(v);
+    gridSvg += `
+      <line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${width - pad.right}" y2="${y.toFixed(1)}" stroke="#1e2d4a" stroke-width="1" />
+      <text x="${pad.left - 8}" y="${(y + 4).toFixed(1)}" fill="#8ea0be" font-size="11" text-anchor="end">${v >= 0 ? "+" : ""}${v.toFixed(1)}%</text>
+    `;
+  }
+
+  const zeroY = yAt(0);
+  const legendItems = [];
+  let polylinesSvg = "";
+
+  results.forEach((r, idx) => {
+    const color = SERIES_COLORS[idx % SERIES_COLORS.length];
+    const pts = (r.equity_curve || [])
+      .map((pt) => `${xAt(new Date(pt.timestamp).getTime()).toFixed(1)},${yAt(Number(pt.return_pct || 0)).toFixed(1)}`)
+      .join(" ");
+    if (pts) {
+      polylinesSvg += `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2.2" stroke-linejoin="round" />`;
+    }
+    legendItems.push(
+      `<span class="legend-item"><span class="legend-swatch" style="background:${color}"></span>${escapeHtml(r.pattern_name)} (${fmtPct(r.return_pct)})</span>`
+    );
+  });
+
+  const startLabel = fmtTime(new Date(minTs).toISOString());
+  const endLabel = fmtTime(new Date(maxTs).toISOString());
+
+  box.innerHTML = `
+    <div class="chart-legend">${legendItems.join("")}</div>
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="全パターン利回り比較チャート">
+      ${gridSvg}
+      <line x1="${pad.left}" y1="${zeroY.toFixed(1)}" x2="${width - pad.right}" y2="${zeroY.toFixed(1)}" stroke="#60a5fa" stroke-width="1.2" stroke-dasharray="5,4" />
+      ${polylinesSvg}
+      <text x="${pad.left}" y="${height - 8}" fill="#8ea0be" font-size="11" text-anchor="start">${escapeHtml(startLabel)}</text>
+      <text x="${width - pad.right}" y="${height - 8}" fill="#8ea0be" font-size="11" text-anchor="end">${escapeHtml(endLabel)}</text>
+    </svg>
+  `;
+}
+
+function renderPatternsTable() {
+  const tbody = document.getElementById("patternsTableBody");
+  const list = getPatternList();
+  const selected = getSelectedPatternData();
+  const selId = selected ? selected.pattern_id || selected.mode : null;
+
+  if (list.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="9" class="empty-cell">パターンが登録されていません。</td></tr>`;
+    return;
+  }
+
+  // Update backtest target dropdown
+  const btSelect = document.getElementById("btTarget");
+  const prevVal = btSelect.value;
+  btSelect.innerHTML =
+    `<option value="__ALL__">🔥 全有効パターンを並行比較 (${list.filter((p) => p.enabled !== false).length}件)</option>` +
+    list
+      .map(
+        (p) =>
+          `<option value="${escapeHtml(p.pattern_id || p.mode)}">${escapeHtml(p.mode_label)} [${escapeHtml(
+            p.interval || "15m"
+          )} / ${fmtJPY(p.initial_capital)}]</option>`
+      )
+      .join("");
+  if (prevVal && Array.from(btSelect.options).some((o) => o.value === prevVal)) {
+    btSelect.value = prevVal;
+  }
+
+  tbody.innerHTML = list
+    .map((p) => {
+      const pid = p.pattern_id || p.mode;
+      const isSelected = pid === selId;
+      const isEnabled = p.enabled !== false;
+      const pnlCls = p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : "";
+      const pat = p.pattern || {};
+      const ruleHint = `買≥${pat.buy_score_threshold ?? 66} / 利確+${((pat.take_profit_pct ?? 0.035) * 100).toFixed(1)}% / 損切-${((pat.stop_loss_pct ?? 0.02) * 100).toFixed(1)}%${pat.close_before_eod ? " / 引け決済" : ""}`;
+      const disableAttr = state.apiAvailable ? "" : "disabled";
+
+      return `
+        <tr class="pattern-row ${isSelected ? "active-row" : ""} ${isEnabled ? "" : "disabled-row"}" data-pid="${escapeHtml(pid)}">
+          <td>
+            <span class="badge ${isEnabled ? "badge-buy" : "badge-hold"}">${isEnabled ? "稼働中" : "停止"}</span>
+          </td>
+          <td>
+            <div class="stock-name">${escapeHtml(p.mode_label)}</div>
+            <div class="stock-meta">${escapeHtml(ruleHint)}</div>
+          </td>
+          <td><b>${fmtJPY(p.initial_capital)}</b></td>
+          <td>
+            <span class="badge badge-hold">${escapeHtml(p.interval || "15m")}足</span>
+            <span class="stock-meta">${p.unit_size}株</span>
+          </td>
+          <td><b>${fmtJPY(p.total_equity)}</b></td>
+          <td class="${pnlCls}">
+            <b>${fmtSignedJPY(p.net_pnl)}</b>
+            <div class="stock-meta ${pnlCls}">${fmtPct(p.return_pct)}</div>
+          </td>
+          <td>
+            <div>${Number(p.win_rate || 0).toFixed(1)}% / PF ${Number(p.profit_factor || 0).toFixed(2)}</div>
+            <div class="stock-meta">最大DD -${Number(p.max_drawdown_pct || 0).toFixed(2)}% (${p.trade_count}取引)</div>
+          </td>
+          <td>${(p.positions || []).length}銘柄</td>
+          <td>
+            <div class="row-actions" onclick="event.stopPropagation()">
+              <button class="btn btn-ghost btn-xs act-edit" data-pid="${escapeHtml(pid)}" ${disableAttr} title="資金・タイミング編集">編集</button>
+              <button class="btn btn-ghost btn-xs act-dup" data-pid="${escapeHtml(pid)}" ${disableAttr} title="このパターンを複製">複製</button>
+              <button class="btn btn-ghost btn-xs act-toggle" data-pid="${escapeHtml(pid)}" ${disableAttr} title="自動監視ON/OFF">${isEnabled ? "停止" : "再開"}</button>
+              <button class="btn btn-danger-ghost btn-xs act-del" data-pid="${escapeHtml(pid)}" ${disableAttr} ${list.length <= 1 ? "disabled" : ""} title="削除">削除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  tbody.querySelectorAll(".pattern-row").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      state.selectedPatternId = tr.dataset.pid;
+      renderDashboard();
+    });
+  });
+
+  tbody.querySelectorAll(".act-edit").forEach((btn) =>
+    btn.addEventListener("click", () => openPatternModal(btn.dataset.pid, false))
+  );
+  tbody.querySelectorAll(".act-dup").forEach((btn) =>
+    btn.addEventListener("click", () => openPatternModal(btn.dataset.pid, true))
+  );
+  tbody.querySelectorAll(".act-toggle").forEach((btn) =>
+    btn.addEventListener("click", () => togglePatternEnabled(btn.dataset.pid))
+  );
+  tbody.querySelectorAll(".act-del").forEach((btn) =>
+    btn.addEventListener("click", () => deletePattern(btn.dataset.pid))
+  );
+}
+
+function renderDashboard() {
+  const dash = state.dashboard;
+  if (!dash) return;
+
+  const ms = dash.market_status || {};
+  const msBadge = document.getElementById("marketStatusBadge");
+  msBadge.textContent = ms.session || "東証ステータス不明";
+  msBadge.className = `pill ${ms.is_open ? "pill-ok" : "pill-warn"}`;
+
+  renderPatternsTable();
+
+  const p = getSelectedPatternData();
+  if (!p) return;
+
+  document.getElementById("lastUpdatedText").textContent = `最終更新: ${fmtTime(dash.generated_at)}`;
+  document.getElementById("selectedPatternTitle").textContent = p.mode_label;
+  const pat = p.pattern || {};
+  document.getElementById("selectedPatternMeta").textContent =
+    `初期資金 ${fmtJPY(p.initial_capital)} ｜ ${p.interval || "15m"}足 ｜ ${p.unit_size}株単位 ｜ 最大${pat.max_positions ?? 3}銘柄 ｜ 買いスコア≥${pat.buy_score_threshold ?? 66} / 売り≤${pat.sell_score_threshold ?? 30} ｜ 利確+${((pat.take_profit_pct ?? 0.035) * 100).toFixed(1)}% / 損切-${((pat.stop_loss_pct ?? 0.02) * 100).toFixed(1)}% ｜ 最新足: ${fmtTime(p.last_bar_ts)}`;
+
+  document.getElementById("kpiCapitalLabel").textContent = `現在の総資産（元手 ${fmtJPY(p.initial_capital)}）`;
+
+  const eqEl = document.getElementById("kpiTotalEquity");
+  eqEl.textContent = fmtJPY(p.total_equity);
+  eqEl.className = `kpi-value ${p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : ""}`;
+
+  const pnlEl = document.getElementById("kpiNetPnl");
+  pnlEl.textContent = `損益 ${fmtSignedJPY(p.net_pnl)} (${fmtPct(p.return_pct)})`;
+  pnlEl.className = `kpi-sub ${p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : ""}`;
+
+  const realEl = document.getElementById("kpiRealizedPnl");
+  realEl.textContent = fmtSignedJPY(p.realized_pnl);
+  realEl.className = `kpi-value ${p.realized_pnl > 0 ? "up" : p.realized_pnl < 0 ? "down" : ""}`;
+  document.getElementById("kpiUnrealizedPnl").textContent =
+    `含み損益: ${fmtSignedJPY(p.unrealized_pnl)} / 手数料計 ${fmtJPY(p.total_fees)}`;
+
+  document.getElementById("kpiCash").textContent = fmtJPY(p.cash);
+  document.getElementById("kpiHoldings").textContent =
+    `保有評価額: ${fmtJPY(p.holdings_value)} (${(p.positions || []).length}銘柄)`;
+
+  document.getElementById("kpiWinRate").textContent = `${Number(p.win_rate || 0).toFixed(1)}%`;
+  document.getElementById("kpiStats").textContent =
+    `決済 ${p.closed_trades}回 / PF ${Number(p.profit_factor || 0).toFixed(2)} / 最大DD -${Number(p.max_drawdown_pct || 0).toFixed(2)}%`;
+
+  renderEquitySVG("liveEquityChart", p.equity_history, p.initial_capital);
+  renderSellEvaluations(p.sell_evaluations || [], p.positions || []);
+  renderRecommendations(p.recommendations || []);
+  renderTrades("tradesBody", p.trades || []);
+}
+
+function renderSellEvaluations(evals, positions) {
+  const container = document.getElementById("sellTimingContainer");
+  if ((!evals || evals.length === 0) && (!positions || positions.length === 0)) {
+    container.innerHTML = `<div class="empty-state">現在保有中の銘柄はありません。<br/>買い条件を満たす銘柄が見つかると自動でエントリーし、ここで売却タイミングを常時推定します。</div>`;
+    return;
+  }
+
+  const list = evals.length > 0 ? evals : positions.map((p) => ({
+    symbol: p.symbol,
+    name: p.name,
+    quantity: p.quantity,
+    entry_price: p.avg_cost,
+    current_price: p.last_price,
+    unrealized_pnl: (p.last_price - p.avg_cost) * p.quantity,
+    unrealized_pnl_pct: p.avg_cost ? ((p.last_price - p.avg_cost) / p.avg_cost) * 100 : 0,
+    should_sell: false,
+    urgency: 20,
+    timing_label: "保有継続",
+    primary_reason: "次回スキャン待ち",
+    target_price: p.target_price,
+    stop_loss_price: p.stop_loss_price,
+    trailing_stop_price: null,
+  }));
+
+  container.innerHTML = list
+    .map((ev) => {
+      const pnlClass = ev.unrealized_pnl >= 0 ? "up" : "down";
+      const badgeClass = ev.should_sell ? "badge-sell" : ev.urgency >= 55 ? "badge-warn" : "badge-buy";
+      const barColor = ev.urgency >= 75 ? "#ef4444" : ev.urgency >= 50 ? "#f59e0b" : "#22c55e";
+      const trailText = ev.trailing_stop_price ? ` / トレール ${fmtPrice(ev.trailing_stop_price)}` : "";
+      return `
+        <div class="sell-item ${ev.should_sell ? "urgent" : ""}">
+          <div class="sell-item-top">
+            <div>
+              <span class="sell-title">${escapeHtml(ev.name)}</span>
+              <span class="stock-meta">(${escapeHtml(ev.symbol)} × ${ev.quantity}株)</span>
+            </div>
+            <span class="badge ${badgeClass}">${escapeHtml(ev.timing_label)} (緊急度 ${Math.round(ev.urgency)})</span>
+          </div>
+          <div class="sell-metrics">
+            <span>取得 ${fmtPrice(ev.entry_price)} → 現在 <b>${fmtPrice(ev.current_price)}</b></span>
+            <span class="${pnlClass}"><b>${fmtSignedJPY(ev.unrealized_pnl)} (${fmtPct(ev.unrealized_pnl_pct)})</b></span>
+            <span>利確目安 ${fmtPrice(ev.target_price)} / 損切り ${fmtPrice(ev.stop_loss_price)}${trailText}</span>
+          </div>
+          <div class="sell-reason">💡 ${escapeHtml(ev.primary_reason)}</div>
+          <div class="urgency-bar"><div class="urgency-fill" style="width:${Math.min(100, ev.urgency)}%;background:${barColor}"></div></div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderRecommendations(recs) {
+  const tbody = document.getElementById("recommendationsBody");
+  const filterVal = document.getElementById("actionFilter").value;
+  const filtered = (recs || []).filter((r) => {
+    if (filterVal === "BUY_ONLY") return r.action === "STRONG_BUY" || r.action === "BUY";
+    if (filterVal === "SELL_ONLY") return r.action === "SELL";
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-cell">該当する監視銘柄データがありません。「全パターン最新スキャン＆補完」を実行してください。</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = filtered
+    .map((r) => {
+      const badgeClass =
+        r.action === "STRONG_BUY"
+          ? "badge-strong-buy"
+          : r.action === "BUY"
+          ? "badge-buy"
+          : r.action === "SELL"
+          ? "badge-sell"
+          : "badge-hold";
+      const chgClass = r.change_pct > 0 ? "up" : r.change_pct < 0 ? "down" : "";
+      const barColor = r.score >= 70 ? "#22c55e" : r.score >= 60 ? "#10b981" : r.score <= 35 ? "#ef4444" : "#64748b";
+      const chips = (r.reasons || []).map((txt) => `<span class="reason-chip">${escapeHtml(txt)}</span>`).join("");
+
+      return `
+        <tr>
+          <td>
+            <div class="stock-name">${escapeHtml(r.name)}</div>
+            <div class="stock-meta">${escapeHtml(r.symbol)} · ${escapeHtml(r.sector)}</div>
+          </td>
+          <td><span class="badge ${badgeClass}">${escapeHtml(r.action_label)}</span></td>
+          <td>
+            <div class="score-pill">
+              <span>${Number(r.score).toFixed(1)}</span>
+              <span class="score-bar"><span class="score-bar-fill" style="width:${r.score}%;background:${barColor}"></span></span>
+            </div>
+          </td>
+          <td><b>${fmtPrice(r.price)}</b><div class="stock-meta">VWAP ${fmtPrice(r.vwap)}</div></td>
+          <td class="${chgClass}">${fmtPct(r.change_pct)}</td>
+          <td>
+            <div class="up">利確 ${fmtPrice(r.target_price)}</div>
+            <div class="down">損切 ${fmtPrice(r.stop_loss_price)} (RR ${r.risk_reward})</div>
+          </td>
+          <td>
+            <div>RSI ${Number(r.rsi14).toFixed(1)}</div>
+            <div class="stock-meta">出来高 ${Number(r.volume_ratio).toFixed(2)}倍</div>
+          </td>
+          <td><div class="reason-list">${chips}</div></td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+function renderTrades(tbodyId, trades) {
+  const tbody = document.getElementById(tbodyId);
+  if (!trades || trades.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-cell">売買履歴はまだありません。</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = trades
+    .slice(0, 120)
+    .map((t) => {
+      const isBuy = t.side === "BUY";
+      const sideBadge = isBuy
+        ? `<span class="badge badge-buy">買い BUY</span>`
+        : `<span class="badge badge-sell">売り SELL</span>`;
+      const pnlText = isBuy
+        ? "--"
+        : `<span class="${t.realized_pnl >= 0 ? "up" : "down"}"><b>${fmtSignedJPY(t.realized_pnl)}</b></span>`;
+      return `
+        <tr>
+          <td>${escapeHtml(fmtTime(t.timestamp))}</td>
+          <td>${sideBadge}</td>
+          <td><b>${escapeHtml(t.name)}</b> <span class="stock-meta">${escapeHtml(t.symbol)}</span></td>
+          <td>${Number(t.quantity).toLocaleString("ja-JP")}株</td>
+          <td>${fmtPrice(t.price)}</td>
+          <td>${pnlText}</td>
+          <td>${escapeHtml(t.reason)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function loadDashboard() {
+  const connBadge = document.getElementById("connectionBadge");
+  try {
+    const resp = await fetch("/api/dashboard", { cache: "no-store" });
+    if (!resp.ok) throw new Error("API unavailable");
+    state.dashboard = await resp.json();
+    state.apiAvailable = true;
+    connBadge.textContent = "🟢 ローカルAPI接続中";
+    connBadge.className = "pill pill-ok";
+    renderDashboard();
+    return;
+  } catch {
+    state.apiAvailable = false;
+  }
+
+  try {
+    const resp = await fetch("./data/dashboard_snapshot.json", { cache: "no-store" });
+    if (!resp.ok) throw new Error("Snapshot missing");
+    state.dashboard = await resp.json();
+    connBadge.textContent = "☁ 静的ビューアモード（GitHub Actions更新）";
+    connBadge.className = "pill pill-warn";
+    ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest"].forEach(
+      (id) => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = true;
+      }
+    );
+    renderDashboard();
+  } catch {
+    connBadge.textContent = "🔴 データ未取得";
+    connBadge.className = "pill pill-warn";
+    showToast("サーバーを起動するか、スナップショットを生成してください。", true);
+  }
+}
+
+async function handleCatchupScan() {
+  if (!state.apiAvailable) return;
+  const btn = document.getElementById("btnCatchup");
+  btn.disabled = true;
+  btn.textContent = "⏳ 全パターン取得・補完中...";
+  try {
+    const resp = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "all", catchup: true, days: 5 }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "スキャンに失敗しました");
+    state.dashboard = data.dashboard;
+    renderDashboard();
+    const summary = (data.results || [])
+      .map((r) => `${r.name || r.pattern_id}: ${r.bars_processed}本 / ${r.trades_executed || 0}約定`)
+      .join(" ｜ ");
+    showToast(`全パターン更新完了 — ${summary}`);
+  } catch (err) {
+    showToast(`エラー: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⚡ 全パターン最新スキャン＆補完";
+  }
+}
+
+async function handleBacktest(e) {
+  e.preventDefault();
+  if (!state.apiAvailable) {
+    showToast("バックテスト実行にはローカルサーバーの起動が必要です。", true);
+    return;
+  }
+  const btn = document.getElementById("btnRunBacktest");
+  btn.disabled = true;
+  btn.textContent = "⏳ 実データ取得・並行測定中...";
+
+  const targetVal = document.getElementById("btTarget").value;
+  const intervalVal = document.getElementById("btInterval").value;
+  const capRaw = document.getElementById("btCapital").value.trim();
+
+  const payload = {
+    compare_all: targetVal === "__ALL__",
+    pattern_id: targetVal === "__ALL__" ? null : targetVal,
+    days: Number(document.getElementById("btDays").value),
+    interval: intervalVal || null,
+    initial_capital: capRaw ? Number(capRaw) : null,
+  };
+
+  try {
+    const resp = await fetch("/api/backtest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const res = await resp.json();
+    if (!resp.ok) throw new Error(res.detail || "バックテストに失敗しました");
+
+    document.getElementById("backtestResults").classList.remove("hidden");
+
+    if (res.compare_mode) {
+      document.getElementById("btComparePanel").classList.remove("hidden");
+      document.getElementById("btSinglePanel").classList.add("hidden");
+      state.lastCompareResults = res.results || [];
+      renderCompareBacktest(state.lastCompareResults);
+      showToast(`全${res.pattern_count}パターンの並行測定完了 — トップ: ${res.best_pattern} (${fmtPct(res.best_return_pct)})`);
+    } else {
+      document.getElementById("btComparePanel").classList.add("hidden");
+      document.getElementById("btSinglePanel").classList.remove("hidden");
+      renderSingleBacktest(res);
+      showToast(`実データ測定完了: ${fmtJPY(res.initial_capital)} → ${fmtJPY(res.final_equity)} (${fmtPct(res.return_pct)})`);
+    }
+  } catch (err) {
+    showToast(`バックテストエラー: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "▶ 実データで並行測定を実行";
+  }
+}
+
+function renderCompareBacktest(results) {
+  const tbody = document.getElementById("btCompareBody");
+  tbody.innerHTML = results
+    .map((r, i) => {
+      const cls = r.net_pnl >= 0 ? "up" : "down";
+      const bm = r.benchmark_nikkei225_pct != null ? fmtPct(r.benchmark_nikkei225_pct) : "--";
+      const color = SERIES_COLORS[i % SERIES_COLORS.length];
+      return `
+        <tr class="pattern-row" data-idx="${i}">
+          <td><b>#${i + 1}</b></td>
+          <td><span class="legend-swatch" style="background:${color};margin-right:6px;"></span><b>${escapeHtml(r.pattern_name)}</b></td>
+          <td>${escapeHtml(r.interval)}足 / ${r.unit_size}株</td>
+          <td>${fmtJPY(r.initial_capital)} → <b>${fmtJPY(r.final_equity)}</b></td>
+          <td class="${cls}"><b>${fmtSignedJPY(r.net_pnl)} (${fmtPct(r.return_pct)})</b></td>
+          <td>${bm}</td>
+          <td>${r.total_trades}回 / 勝率 ${Number(r.win_rate).toFixed(1)}% / PF ${r.profit_factor}</td>
+          <td class="down">-${Number(r.max_drawdown_pct).toFixed(2)}%</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  tbody.querySelectorAll("tr").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const item = results[Number(tr.dataset.idx)];
+      if (item) {
+        document.getElementById("btTradeCount").textContent = String((item.trades || []).length);
+        renderTrades("btTradesBody", item.trades || []);
+      }
+    });
+  });
+
+  renderMultiCompareSVG("btCompareChart", results);
+  if (results[0]) {
+    document.getElementById("btTradeCount").textContent = String((results[0].trades || []).length);
+    renderTrades("btTradesBody", results[0].trades || []);
+  }
+}
+
+function renderSingleBacktest(res) {
+  const pnlCls = res.net_pnl >= 0 ? "up" : "down";
+  const bmText = res.benchmark_nikkei225_pct != null ? fmtPct(res.benchmark_nikkei225_pct) : "取得不可";
+
+  document.getElementById("btSummaryCards").innerHTML = `
+    <div class="bt-stat">
+      <div class="bt-stat-label">最終資産 (元手 ${fmtJPY(res.initial_capital)})</div>
+      <div class="bt-stat-val ${pnlCls}">${fmtJPY(res.final_equity)}</div>
+      <div class="stock-meta ${pnlCls}">${fmtSignedJPY(res.net_pnl)} (${fmtPct(res.return_pct)})</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">勝率 / プロフィットファクター</div>
+      <div class="bt-stat-val">${Number(res.win_rate).toFixed(1)}% / PF ${res.profit_factor}</div>
+      <div class="stock-meta">総取引 ${res.total_trades}回 (決済 ${res.closed_trades}回)</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">最大ドローダウン</div>
+      <div class="bt-stat-val down">-${Number(res.max_drawdown_pct).toFixed(2)}%</div>
+      <div class="stock-meta">手数料計 ${fmtJPY(res.total_fees)}</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">同期間 日経平均 (^N225)</div>
+      <div class="bt-stat-val">${bmText}</div>
+      <div class="stock-meta">対象 ${res.symbols_loaded}銘柄 / ${res.bars_simulated}本</div>
+    </div>
+    <div class="bt-stat">
+      <div class="bt-stat-label">測定期間 (${escapeHtml(res.interval)}足)</div>
+      <div class="bt-stat-val" style="font-size:0.88rem">${fmtTime(res.start_time)} 〜 ${fmtTime(res.end_time)}</div>
+      <div class="stock-meta">${escapeHtml(res.pattern_name)}</div>
+    </div>
+  `;
+
+  renderEquitySVG("btEquityChart", res.equity_curve, res.initial_capital);
+  document.getElementById("btTradeCount").textContent = String((res.trades || []).length);
+  renderTrades("btTradesBody", res.trades || []);
+}
+
+function openPatternModal(patternId = null, duplicate = false) {
+  if (!state.apiAvailable) return;
+  const form = document.getElementById("patternForm");
+  const titleEl = document.getElementById("patternModalTitle");
+  const resetWrap = document.getElementById("resetOnSaveWrap");
+
+  const list = getPatternList();
+  const existing = patternId ? list.find((p) => (p.pattern_id || p.mode) === patternId) : null;
+  const pat = existing && existing.pattern ? existing.pattern : null;
+
+  if (pat && !duplicate) {
+    titleEl.textContent = `⚙ パターン編集: ${pat.name}`;
+    form.pattern_id.value = pat.id;
+    resetWrap.classList.remove("hidden");
+  } else {
+    titleEl.textContent = duplicate ? "📋 パターンを複製して新規作成" : "＋ 新規シミュレーションパターン作成";
+    form.pattern_id.value = "";
+    resetWrap.classList.add("hidden");
+  }
+
+  form.name.value = pat ? (duplicate ? `${pat.name} (コピー)` : pat.name) : "カスタムパターン 30万円（15分足）";
+  form.description.value = pat ? pat.description || "" : "";
+  form.initial_capital.value = pat ? pat.initial_capital : 300000;
+  form.interval.value = pat ? pat.interval : "15m";
+  form.unit_size.value = String(pat ? pat.unit_size : 1);
+  form.watchlist_key.value = pat ? pat.watchlist_key : "lot1";
+  form.max_positions.value = pat ? pat.max_positions : 3;
+  form.max_allocation_pct.value = Math.round((pat ? pat.max_allocation_pct : 0.4) * 100);
+  form.buy_score_threshold.value = pat ? pat.buy_score_threshold : 66;
+  form.strong_buy_threshold.value = pat ? pat.strong_buy_threshold : 76;
+  form.sell_score_threshold.value = pat ? pat.sell_score_threshold : 30;
+  form.take_profit_pct.value = ((pat ? pat.take_profit_pct : 0.035) * 100).toFixed(1);
+  form.stop_loss_pct.value = ((pat ? pat.stop_loss_pct : 0.02) * 100).toFixed(1);
+  form.trailing_activation_pct.value = ((pat ? pat.trailing_activation_pct : 0.015) * 100).toFixed(1);
+  form.trailing_stop_pct.value = ((pat ? pat.trailing_stop_pct : 0.01) * 100).toFixed(1);
+  form.slippage_bps.value = pat ? pat.slippage_bps : 5;
+  form.close_before_eod.checked = pat ? Boolean(pat.close_before_eod) : false;
+  form.enabled.checked = pat ? Boolean(pat.enabled) : true;
+  form.reset_portfolio.checked = false;
+
+  document.getElementById("patternModal").classList.remove("hidden");
+}
+
+async function savePatternForm(e) {
+  e.preventDefault();
+  const form = e.target;
+  const pid = form.pattern_id.value.trim();
+
+  const payload = {
+    name: form.name.value.trim(),
+    description: form.description.value.trim(),
+    initial_capital: Number(form.initial_capital.value),
+    interval: form.interval.value,
+    unit_size: Number(form.unit_size.value),
+    watchlist_key: form.watchlist_key.value,
+    max_positions: Number(form.max_positions.value),
+    max_allocation_pct: Number(form.max_allocation_pct.value) / 100,
+    buy_score_threshold: Number(form.buy_score_threshold.value),
+    strong_buy_threshold: Number(form.strong_buy_threshold.value),
+    sell_score_threshold: Number(form.sell_score_threshold.value),
+    take_profit_pct: Number(form.take_profit_pct.value) / 100,
+    stop_loss_pct: Number(form.stop_loss_pct.value) / 100,
+    trailing_activation_pct: Number(form.trailing_activation_pct.value) / 100,
+    trailing_stop_pct: Number(form.trailing_stop_pct.value) / 100,
+    slippage_bps: Number(form.slippage_bps.value),
+    close_before_eod: form.close_before_eod.checked,
+    enabled: form.enabled.checked,
+  };
+
+  if (pid) {
+    payload.reset_portfolio = form.reset_portfolio.checked;
+  }
+
+  try {
+    const url = pid ? `/api/patterns/${encodeURIComponent(pid)}` : "/api/patterns";
+    const method = pid ? "PUT" : "POST";
+    const resp = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "保存に失敗しました");
+    state.dashboard = data.dashboard;
+    state.selectedPatternId = data.pattern.id;
+    document.getElementById("patternModal").classList.add("hidden");
+    renderDashboard();
+    showToast(pid ? `パターン「${data.pattern.name}」を更新しました。` : `新規パターン「${data.pattern.name}」を追加しました。`);
+  } catch (err) {
+    showToast(`パターン保存エラー: ${err.message}`, true);
+  }
+}
+
+async function togglePatternEnabled(pid) {
+  const list = getPatternList();
+  const target = list.find((p) => (p.pattern_id || p.mode) === pid);
+  if (!target) return;
+  try {
+    const resp = await fetch(`/api/patterns/${encodeURIComponent(pid)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !target.enabled }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "切替失敗");
+    state.dashboard = data.dashboard;
+    renderDashboard();
+    showToast(`「${target.mode_label}」を${!target.enabled ? "稼働中" : "停止"}に変更しました。`);
+  } catch (err) {
+    showToast(`エラー: ${err.message}`, true);
+  }
+}
+
+async function deletePattern(pid) {
+  const list = getPatternList();
+  const target = list.find((p) => (p.pattern_id || p.mode) === pid);
+  if (!target) return;
+  if (!confirm(`パターン「${target.mode_label}」とそのシミュレーション履歴を削除しますか？`)) return;
+  try {
+    const resp = await fetch(`/api/patterns/${encodeURIComponent(pid)}`, { method: "DELETE" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "削除失敗");
+    state.dashboard = data.dashboard;
+    if (state.selectedPatternId === pid) state.selectedPatternId = null;
+    renderDashboard();
+    showToast(`パターン「${target.mode_label}」を削除しました。`);
+  } catch (err) {
+    showToast(`エラー: ${err.message}`, true);
+  }
+}
+
+async function handleResetSelected() {
+  const p = getSelectedPatternData();
+  if (!p || !state.apiAvailable) return;
+  const pid = p.pattern_id || p.mode;
+  const capStr = prompt(
+    `「${p.mode_label}」のシミュレーションをリセットします。\n新しい初期資金（円）を入力してください:`,
+    String(Math.round(p.initial_capital))
+  );
+  if (capStr === null) return;
+  const newCap = Number(capStr);
+  if (!Number.isFinite(newCap) || newCap < 1000) {
+    showToast("1,000円以上の数値を入力してください。", true);
+    return;
+  }
+  try {
+    const resp = await fetch(`/api/patterns/${encodeURIComponent(pid)}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial_capital: newCap }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "リセット失敗");
+    state.dashboard = data.dashboard;
+    renderDashboard();
+    showToast(`「${p.mode_label}」を元手 ${fmtJPY(newCap)} でリセットしました。`);
+  } catch (err) {
+    showToast(`エラー: ${err.message}`, true);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("actionFilter").addEventListener("change", renderDashboard);
+  document.getElementById("btnCatchup").addEventListener("click", handleCatchupScan);
+  document.getElementById("btnAddPattern").addEventListener("click", () => openPatternModal(null, false));
+  document.getElementById("btnAddPatternTop").addEventListener("click", () => openPatternModal(null, false));
+  document.getElementById("btnEditSelected").addEventListener("click", () => {
+    const p = getSelectedPatternData();
+    if (p) openPatternModal(p.pattern_id || p.mode, false);
+  });
+  document.getElementById("btnResetSelected").addEventListener("click", handleResetSelected);
+  document.getElementById("backtestForm").addEventListener("submit", handleBacktest);
+  document.getElementById("patternForm").addEventListener("submit", savePatternForm);
+  document.getElementById("btnClosePatternModal").addEventListener("click", () =>
+    document.getElementById("patternModal").classList.add("hidden")
+  );
+  document.getElementById("btnCancelPatternModal").addEventListener("click", () =>
+    document.getElementById("patternModal").classList.add("hidden")
+  );
+  document.querySelectorAll(".cap-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.getElementById("patternForm").initial_capital.value = btn.dataset.val;
+    });
+  });
+
+  loadDashboard();
+});

@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kabushiki | 日本株監視・売却タイミング推定・複数パターン並行シミュレータ</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span class="brand-icon">📈</span>
+        <div>
+          <h1>Kabushiki <span>JP Stock Monitor &amp; Multi-Pattern Simulator</span></h1>
+          <p class="subtitle">東証リアルタイム監視・おすすめ銘柄・売却タイミング推定・複数パターン並行シミュレーション（PC OFF対応）</p>
+        </div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div id="connectionBadge" class="pill pill-neutral">接続確認中...</div>
+      <div id="marketStatusBadge" class="pill pill-neutral">東証ステータス取得中...</div>
+      <div class="action-group">
+        <button id="btnCatchup" class="btn btn-primary" title="全有効パターンを並行でPC OFF補完＋最新スキャン">
+          ⚡ 全パターン最新スキャン＆補完
+        </button>
+        <button id="btnAddPatternTop" class="btn btn-accent">＋ パターン追加</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="toastArea" class="toast hidden"></div>
+
+    <!-- Parallel Pattern Comparison Board -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>🧩 並行シミュレーション パターン一覧＆成績比較</h2>
+          <p class="card-desc">初期資金・監視間隔（5〜60分）・取引単位（1株/100株）・売買タイミングが異なる複数パターンを並行稼働できます。行をクリックすると下に詳細を表示します。</p>
+        </div>
+        <div class="action-group">
+          <span id="lastUpdatedText" class="meta-text">最終更新: --</span>
+          <button id="btnAddPattern" class="btn btn-accent btn-sm">＋ 新規パターン追加</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>状態</th>
+              <th>パターン名 / 設定</th>
+              <th>初期資金</th>
+              <th>間隔 / 単位</th>
+              <th>現在資産</th>
+              <th>損益 (利回り)</th>
+              <th>勝率 / PF / 最大DD</th>
+              <th>保有</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="patternsTableBody">
+            <tr><td colspan="9" class="empty-cell">パターンを読み込み中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Active Pattern Detail Header -->
+    <section class="selected-banner" id="selectedPatternBanner">
+      <div>
+        <div class="selected-label">詳細表示中のパターン</div>
+        <div class="selected-title" id="selectedPatternTitle">--</div>
+        <div class="selected-meta" id="selectedPatternMeta">--</div>
+      </div>
+      <div class="action-group">
+        <button id="btnEditSelected" class="btn btn-ghost btn-sm">⚙ このパターンの資金・タイミング変更</button>
+        <button id="btnResetSelected" class="btn btn-danger-ghost btn-sm">↺ 初期資金にリセット</button>
+      </div>
+    </section>
+
+    <!-- KPI Cards for Selected Pattern -->
+    <section class="kpi-grid">
+      <div class="card kpi-card highlight">
+        <div class="kpi-label" id="kpiCapitalLabel">現在の総資産（元手 ¥100,000）</div>
+        <div class="kpi-value" id="kpiTotalEquity">¥100,000</div>
+        <div class="kpi-sub" id="kpiNetPnl">損益 ¥0 (0.00%)</div>
+      </div>
+      <div class="card kpi-card">
+        <div class="kpi-label">確定損益 / 含み損益</div>
+        <div class="kpi-value" id="kpiRealizedPnl">¥0</div>
+        <div class="kpi-sub" id="kpiUnrealizedPnl">含み損益: ¥0</div>
+      </div>
+      <div class="card kpi-card">
+        <div class="kpi-label">現金余力 / 保有株評価額</div>
+        <div class="kpi-value" id="kpiCash">¥100,000</div>
+        <div class="kpi-sub" id="kpiHoldings">保有評価額: ¥0 (0銘柄)</div>
+      </div>
+      <div class="card kpi-card">
+        <div class="kpi-label">勝率 / PF / 最大DD</div>
+        <div class="kpi-value" id="kpiWinRate">0.0%</div>
+        <div class="kpi-sub" id="kpiStats">決済 0回 / PF 0.00 / 最大DD -0.00%</div>
+      </div>
+    </section>
+
+    <!-- Main 2-Column Area: Equity Chart + Sell Timing Estimator -->
+    <section class="grid-two">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>📊 資産推移（選択中パターン）</h2>
+            <p class="card-desc">GitHub Actions（PC OFF中）＋ローカル補完で記録された実データ推移</p>
+          </div>
+        </div>
+        <div class="chart-box" id="liveEquityChart">
+          <div class="empty-state">「全パターン最新スキャン＆補完」を押すと実データから資産推移を記録します。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>🔔 保有銘柄の売却タイミング推定</h2>
+            <p class="card-desc">利確目標・損切りライン・トレーリングストップ・テクニカル反転をリアルタイム診断</p>
+          </div>
+        </div>
+        <div id="sellTimingContainer" class="sell-list">
+          <div class="empty-state">現在保有中の銘柄はありません。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recommended Stocks Table -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>🎯 おすすめ投資先ランキング（買いスコア順）</h2>
+          <p class="card-desc">EMA・SMA60・VWAP・MACD・RSI・ボリンジャーバンド・出来高倍率から0〜100点で総合評価</p>
+        </div>
+        <div class="filter-group">
+          <select id="actionFilter" class="select-input">
+            <option value="ALL">すべて表示</option>
+            <option value="BUY_ONLY">買い推奨のみ</option>
+            <option value="SELL_ONLY">売り警戒のみ</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>銘柄</th>
+              <th>判定</th>
+              <th>スコア</th>
+              <th>現在値</th>
+              <th>前足比</th>
+              <th>利確目安 / 損切り目安</th>
+              <th>RSI / 出来高</th>
+              <th>推定根拠</th>
+            </tr>
+          </thead>
+          <tbody id="recommendationsBody">
+            <tr><td colspan="8" class="empty-cell">データ読込中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Real-Data Parallel Backtest Measurement Tool -->
+    <section class="card backtest-section" id="backtestSection">
+      <div class="card-header">
+        <div>
+          <h2>🧪 実データ並行比較・測定ツール（任意資金・任意間隔バックテスト）</h2>
+          <p class="card-desc">Yahoo Finance の実際の日本株日中足データを用いて、全有効パターンを並行比較したり、任意パターンの資金・間隔を変えて即時検証できます</p>
+        </div>
+      </div>
+
+      <form id="backtestForm" class="bt-controls">
+        <label>
+          <span>測定対象</span>
+          <select id="btTarget" class="select-input">
+            <option value="__ALL__" selected>🔥 全有効パターンを並行比較</option>
+          </select>
+        </label>
+        <label>
+          <span>検証期間</span>
+          <select id="btDays" class="select-input">
+            <option value="5">直近 5日間</option>
+            <option value="10" selected>直近 10日間</option>
+            <option value="14">直近 14日間</option>
+            <option value="20">直近 20日間</option>
+            <option value="30">直近 30日間</option>
+            <option value="45">直近 45日間</option>
+          </select>
+        </label>
+        <label>
+          <span>間隔上書き（任意）</span>
+          <select id="btInterval" class="select-input">
+            <option value="" selected>各パターンの設定を使用</option>
+            <option value="5m">5分間隔 (5m足)</option>
+            <option value="10m">10分間隔 (10m足)</option>
+            <option value="15m">15分間隔 (15m足)</option>
+            <option value="30m">30分間隔 (30m足)</option>
+            <option value="60m">60分間隔 (60m足)</option>
+          </select>
+        </label>
+        <label>
+          <span>初期資金上書き（空欄=各パターン設定）</span>
+          <input id="btCapital" type="number" class="text-input" placeholder="例: 100000 / 300000" min="1000" step="10000" />
+        </label>
+        <button type="submit" id="btnRunBacktest" class="btn btn-accent">
+          ▶ 実データで並行測定を実行
+        </button>
+      </form>
+
+      <div id="backtestResults" class="hidden">
+        <!-- Multi-pattern comparison table (shown in compare_all mode) -->
+        <div id="btComparePanel" class="hidden">
+          <div class="table-wrap" style="margin-bottom: 14px;">
+            <table class="data-table compact">
+              <thead>
+                <tr>
+                  <th>順位</th>
+                  <th>パターン名</th>
+                  <th>間隔 / 単位</th>
+                  <th>初期資金 → 最終資産</th>
+                  <th>損益 (利回り)</th>
+                  <th>日経平均比</th>
+                  <th>取引 / 勝率 / PF</th>
+                  <th>最大DD</th>
+                </tr>
+              </thead>
+              <tbody id="btCompareBody"></tbody>
+            </table>
+          </div>
+          <div class="chart-box" id="btCompareChart"></div>
+        </div>
+
+        <!-- Single-pattern detailed view -->
+        <div id="btSinglePanel" class="hidden">
+          <div class="bt-summary-grid" id="btSummaryCards"></div>
+          <div class="chart-box" id="btEquityChart"></div>
+        </div>
+
+        <details class="bt-trades-details">
+          <summary>選択パターンのバックテスト売買履歴を表示 (<span id="btTradeCount">0</span>件)</summary>
+          <div class="table-wrap">
+            <table class="data-table compact">
+              <thead>
+                <tr>
+                  <th>日時 (JST)</th>
+                  <th>売買</th>
+                  <th>銘柄</th>
+                  <th>株数</th>
+                  <th>約定価格</th>
+                  <th>実現損益</th>
+                  <th>理由</th>
+                </tr>
+              </thead>
+              <tbody id="btTradesBody"></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- Live Trade History for Selected Pattern -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>📜 継続シミュレーション売買履歴（選択中パターン）</h2>
+          <p class="card-desc">自動監視・PC OFF補完で実行された売買ログ</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>日時 (JST)</th>
+              <th>売買</th>
+              <th>銘柄</th>
+              <th>株数</th>
+              <th>約定価格</th>
+              <th>実現損益</th>
+              <th>売買理由</th>
+            </tr>
+          </thead>
+          <tbody id="tradesBody">
+            <tr><td colspan="7" class="empty-cell">売買履歴はまだありません。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="disclaimer">
+      ⚠ 本ツールは過去および公開市場データに基づく教育・検証用シミュレータであり、特定の金融商品の売買を勧誘・保証するものではありません。実際の投資判断はご自身の責任で行ってください。
+    </footer>
+  </main>
+
+  <!-- Pattern Create / Edit Modal -->
+  <div id="patternModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="patternModalTitle">⚙ シミュレーションパターン設定</h2>
+        <button id="btnClosePatternModal" class="btn btn-ghost btn-sm">✕</button>
+      </div>
+      <form id="patternForm" class="config-grid">
+        <input type="hidden" name="pattern_id" />
+        <label class="full-span">
+          <span>パターン名</span>
+          <input name="name" type="text" required class="text-input" placeholder="例: 積極デイトレ 30万円（10分足）" />
+        </label>
+        <label class="full-span">
+          <span>メモ・説明（任意）</span>
+          <input name="description" type="text" class="text-input" placeholder="例: 10分足で回転率重視・大引け前決済" />
+        </label>
+        <label class="full-span">
+          <span>初期資金 (円) — 任意金額に変更可能</span>
+          <div class="capital-row">
+            <input name="initial_capital" type="number" min="1000" step="10000" required class="text-input" />
+            <div class="preset-btns">
+              <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="50000">5万</button>
+              <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="100000">10万</button>
+              <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="300000">30万</button>
+              <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="500000">50万</button>
+              <button type="button" class="btn btn-ghost btn-xs cap-preset" data-val="1000000">100万</button>
+            </div>
+          </div>
+        </label>
+        <label>
+          <span>売買チェック間隔（タイミング）</span>
+          <select name="interval" class="select-input">
+            <option value="5m">5分間隔 (5m足)</option>
+            <option value="10m">10分間隔 (10m足)</option>
+            <option value="15m">15分間隔 (15m足)</option>
+            <option value="30m">30分間隔 (30m足)</option>
+            <option value="60m">60分間隔 (60m足)</option>
+          </select>
+        </label>
+        <label>
+          <span>取引単位</span>
+          <select name="unit_size" class="select-input">
+            <option value="1">1株単位（単元未満株）</option>
+            <option value="100">100株単位（単元株）</option>
+          </select>
+        </label>
+        <label>
+          <span>監視銘柄グループ</span>
+          <select name="watchlist_key" class="select-input">
+            <option value="lot1">主要大型株（トヨタ・ソニー・任天堂等）</option>
+            <option value="lot100">低位・中小型株（10万円以内単元株向け）</option>
+          </select>
+        </label>
+        <label>
+          <span>最大同時保有銘柄数</span>
+          <input name="max_positions" type="number" min="1" max="20" class="text-input" />
+        </label>
+        <label>
+          <span>1銘柄あたり最大投資比率 (%)</span>
+          <input name="max_allocation_pct" type="number" min="10" max="100" step="5" class="text-input" />
+        </label>
+        <label>
+          <span>買い推奨スコア閾値 (0-100)</span>
+          <input name="buy_score_threshold" type="number" min="40" max="90" step="1" class="text-input" />
+        </label>
+        <label>
+          <span>強い買いスコア閾値 (0-100)</span>
+          <input name="strong_buy_threshold" type="number" min="50" max="98" step="1" class="text-input" />
+        </label>
+        <label>
+          <span>売りシグナルスコア閾値 (0-100)</span>
+          <input name="sell_score_threshold" type="number" min="10" max="60" step="1" class="text-input" />
+        </label>
+        <label>
+          <span>利確目標 (%)</span>
+          <input name="take_profit_pct" type="number" min="0.5" max="30" step="0.5" class="text-input" />
+        </label>
+        <label>
+          <span>損切りライン (%)</span>
+          <input name="stop_loss_pct" type="number" min="0.5" max="20" step="0.5" class="text-input" />
+        </label>
+        <label>
+          <span>トレーリング発動利益 (%)</span>
+          <input name="trailing_activation_pct" type="number" min="0.5" max="15" step="0.5" class="text-input" />
+        </label>
+        <label>
+          <span>トレーリング反落幅 (%)</span>
+          <input name="trailing_stop_pct" type="number" min="0.3" max="10" step="0.2" class="text-input" />
+        </label>
+        <label>
+          <span>スリッページ想定 (bps, 5=0.05%)</span>
+          <input name="slippage_bps" type="number" min="0" max="100" step="1" class="text-input" />
+        </label>
+        <label class="checkbox-label">
+          <input name="close_before_eod" type="checkbox" />
+          <span>大引け前（15:10以降）に強制決済（デイトレモード）</span>
+        </label>
+        <label class="checkbox-label">
+          <input name="enabled" type="checkbox" checked />
+          <span>並行自動監視（PC OFF / GitHub Actions・一括スキャン）の対象に含める</span>
+        </label>
+        <label class="checkbox-label hidden" id="resetOnSaveWrap">
+          <input name="reset_portfolio" type="checkbox" />
+          <span>保存と同時にこのパターンの資産を新しい初期資金でリセットする</span>
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="btnCancelPatternModal" class="btn btn-ghost">キャンセル</button>
+          <button type="submit" class="btn btn-primary">パターンを保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
