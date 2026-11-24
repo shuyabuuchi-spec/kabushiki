@@ -1,4 +1,4 @@
-"""SQLite persistence and multi-pattern static JSON snapshot exporter for Kabushiki."""
+"""SQLite persistence with pending pre-orders, commissions, 20% tax tracking, and snapshot export."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS portfolios (
     cash REAL NOT NULL,
     realized_pnl REAL NOT NULL DEFAULT 0.0,
     total_fees REAL NOT NULL DEFAULT 0.0,
+    total_tax REAL NOT NULL DEFAULT 0.0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_bar_ts TEXT
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS positions (
     name TEXT NOT NULL,
     quantity INTEGER NOT NULL,
     avg_cost REAL NOT NULL,
+    buy_fee REAL NOT NULL DEFAULT 0.0,
     highest_price REAL NOT NULL,
     target_price REAL NOT NULL,
     stop_loss_price REAL NOT NULL,
@@ -46,10 +48,25 @@ CREATE TABLE IF NOT EXISTS positions (
     PRIMARY KEY (mode, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS pending_orders (
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    side TEXT NOT NULL,
+    signal_time TEXT NOT NULL,
+    signal_price REAL NOT NULL,
+    score REAL NOT NULL DEFAULT 0.0,
+    target_price REAL NOT NULL DEFAULT 0.0,
+    stop_loss_price REAL NOT NULL DEFAULT 0.0,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (mode, symbol, side)
+);
+
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mode TEXT NOT NULL,
     timestamp TEXT NOT NULL,
+    signal_time TEXT NOT NULL DEFAULT '',
     symbol TEXT NOT NULL,
     name TEXT NOT NULL,
     side TEXT NOT NULL,
@@ -57,6 +74,7 @@ CREATE TABLE IF NOT EXISTS trades (
     price REAL NOT NULL,
     gross_amount REAL NOT NULL,
     fee REAL NOT NULL,
+    tax REAL NOT NULL DEFAULT 0.0,
     realized_pnl REAL NOT NULL DEFAULT 0.0,
     reason TEXT NOT NULL
 );
@@ -105,9 +123,19 @@ class Storage:
         conn.execute("PRAGMA temp_store = MEMORY")
         return conn
 
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            # Safe schema migrations for existing DB files
+            self._ensure_column(conn, "portfolios", "total_tax", "REAL NOT NULL DEFAULT 0.0")
+            self._ensure_column(conn, "positions", "buy_fee", "REAL NOT NULL DEFAULT 0.0")
+            self._ensure_column(conn, "trades", "signal_time", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "trades", "tax", "REAL NOT NULL DEFAULT 0.0")
 
     def ensure_portfolio(
         self,
@@ -122,14 +150,13 @@ class Storage:
             if row is None:
                 conn.execute(
                     """
-                    INSERT INTO portfolios (mode, unit_size, initial_capital, cash, realized_pnl, total_fees, created_at, updated_at, last_bar_ts)
-                    VALUES (?, ?, ?, ?, 0.0, 0.0, ?, ?, NULL)
+                    INSERT INTO portfolios (mode, unit_size, initial_capital, cash, realized_pnl, total_fees, total_tax, created_at, updated_at, last_bar_ts)
+                    VALUES (?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?, NULL)
                     """,
                     (mode, resolved_unit, float(initial_capital), float(initial_capital), now, now),
                 )
                 row = conn.execute("SELECT * FROM portfolios WHERE mode = ?", (mode,)).fetchone()
             else:
-                # Keep unit_size in sync if pattern definition was edited before trades
                 if unit_size is not None and int(row["unit_size"]) != resolved_unit:
                     conn.execute(
                         "UPDATE portfolios SET unit_size = ?, updated_at = ? WHERE mode = ?",
@@ -148,14 +175,15 @@ class Storage:
         now = now_jst().isoformat()
         with self._connect() as conn:
             conn.execute("DELETE FROM positions WHERE mode = ?", (mode,))
+            conn.execute("DELETE FROM pending_orders WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM trades WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM equity_history WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM latest_snapshots WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM portfolios WHERE mode = ?", (mode,))
             conn.execute(
                 """
-                INSERT INTO portfolios (mode, unit_size, initial_capital, cash, realized_pnl, total_fees, created_at, updated_at, last_bar_ts)
-                VALUES (?, ?, ?, ?, 0.0, 0.0, ?, ?, NULL)
+                INSERT INTO portfolios (mode, unit_size, initial_capital, cash, realized_pnl, total_fees, total_tax, created_at, updated_at, last_bar_ts)
+                VALUES (?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?, NULL)
                 """,
                 (mode, resolved_unit, float(initial_capital), float(initial_capital), now, now),
             )
@@ -165,6 +193,7 @@ class Storage:
     def delete_portfolio(self, mode: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM positions WHERE mode = ?", (mode,))
+            conn.execute("DELETE FROM pending_orders WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM trades WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM equity_history WHERE mode = ?", (mode,))
             conn.execute("DELETE FROM latest_snapshots WHERE mode = ?", (mode,))
@@ -184,6 +213,7 @@ class Storage:
         cash: float,
         realized_pnl: float,
         total_fees: float,
+        total_tax: float = 0.0,
         last_bar_ts: str | None = None,
     ) -> None:
         now = now_jst().isoformat()
@@ -192,19 +222,19 @@ class Storage:
                 conn.execute(
                     """
                     UPDATE portfolios
-                    SET cash = ?, realized_pnl = ?, total_fees = ?, updated_at = ?, last_bar_ts = ?
+                    SET cash = ?, realized_pnl = ?, total_fees = ?, total_tax = ?, updated_at = ?, last_bar_ts = ?
                     WHERE mode = ?
                     """,
-                    (cash, realized_pnl, total_fees, now, last_bar_ts, mode),
+                    (cash, realized_pnl, total_fees, total_tax, now, last_bar_ts, mode),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE portfolios
-                    SET cash = ?, realized_pnl = ?, total_fees = ?, updated_at = ?
+                    SET cash = ?, realized_pnl = ?, total_fees = ?, total_tax = ?, updated_at = ?
                     WHERE mode = ?
                     """,
-                    (cash, realized_pnl, total_fees, now, mode),
+                    (cash, realized_pnl, total_fees, total_tax, now, mode),
                 )
 
     def get_positions(self, mode: str) -> list[dict[str, Any]]:
@@ -219,12 +249,13 @@ class Storage:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO positions (mode, symbol, name, quantity, avg_cost, highest_price, target_price, stop_loss_price, entry_time, last_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions (mode, symbol, name, quantity, avg_cost, buy_fee, highest_price, target_price, stop_loss_price, entry_time, last_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mode, symbol) DO UPDATE SET
                     name = excluded.name,
                     quantity = excluded.quantity,
                     avg_cost = excluded.avg_cost,
+                    buy_fee = excluded.buy_fee,
                     highest_price = excluded.highest_price,
                     target_price = excluded.target_price,
                     stop_loss_price = excluded.stop_loss_price,
@@ -237,6 +268,7 @@ class Storage:
                     pos["name"],
                     int(pos["quantity"]),
                     float(pos["avg_cost"]),
+                    float(pos.get("buy_fee", 0.0)),
                     float(pos["highest_price"]),
                     float(pos["target_price"]),
                     float(pos["stop_loss_price"]),
@@ -248,6 +280,37 @@ class Storage:
     def delete_position(self, mode: str, symbol: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM positions WHERE mode = ? AND symbol = ?", (mode, symbol))
+
+    def get_pending_orders(self, mode: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_orders WHERE mode = ? ORDER BY side DESC, score DESC",
+                (mode,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def replace_pending_orders(self, mode: str, orders: list[dict[str, Any]]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_orders WHERE mode = ?", (mode,))
+            for o in orders:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO pending_orders (mode, symbol, name, side, signal_time, signal_price, score, target_price, stop_loss_price, reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mode,
+                        o["symbol"],
+                        o["name"],
+                        o["side"],
+                        str(o["signal_time"]),
+                        float(o["signal_price"]),
+                        float(o.get("score", 0.0)),
+                        float(o.get("target_price", 0.0)),
+                        float(o.get("stop_loss_price", 0.0)),
+                        str(o["reason"]),
+                    ),
+                )
 
     def record_trade(
         self,
@@ -262,16 +325,19 @@ class Storage:
         fee: float,
         realized_pnl: float,
         reason: str,
+        signal_time: str = "",
+        tax: float = 0.0,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO trades (mode, timestamp, symbol, name, side, quantity, price, gross_amount, fee, realized_pnl, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (mode, timestamp, signal_time, symbol, name, side, quantity, price, gross_amount, fee, tax, realized_pnl, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mode,
                     timestamp,
+                    signal_time,
                     symbol,
                     name,
                     side,
@@ -279,6 +345,7 @@ class Storage:
                     float(price),
                     float(gross_amount),
                     float(fee),
+                    float(tax),
                     float(realized_pnl),
                     reason,
                 ),
@@ -385,6 +452,8 @@ class Storage:
             initial_capital=pattern.initial_capital,
             unit_size=pattern.unit_size,
             label=pattern.name,
+            tax_rate=pattern.tax_rate,
+            fee_rate=pattern.fee_rate,
         )
         summary["pattern_id"] = pattern.id
         summary["pattern"] = pattern.to_dict()
@@ -400,9 +469,12 @@ class Storage:
         initial_capital: float = 100000.0,
         unit_size: int | None = None,
         label: str | None = None,
+        tax_rate: float = 0.20315,
+        fee_rate: float = 0.001,
     ) -> dict[str, Any]:
         portfolio = self.get_portfolio(mode, initial_capital, unit_size=unit_size)
         positions = self.get_positions(mode)
+        pending_orders = self.get_pending_orders(mode)
         trades = self.get_trades(mode, limit=150)
         equity_history = self.get_equity_history(mode, limit=600)
         signals = self.get_latest_signals(mode)
@@ -410,12 +482,27 @@ class Storage:
         holdings_value = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions)
         unrealized_pnl = sum(
             (float(p["last_price"]) - float(p["avg_cost"])) * int(p["quantity"])
+            - float(p.get("buy_fee", 0.0))
+            - float(p["last_price"]) * int(p["quantity"]) * fee_rate
             for p in positions
         )
+        # Cash already reflects fees paid and realized tax withheld/refunded
         total_equity = float(portfolio["cash"]) + holdings_value
+        total_tax_paid = float(portfolio.get("total_tax", 0.0))
+        realized_pnl = float(portfolio["realized_pnl"])
+
+        # Estimated additional tax if all current holdings were liquidated now
+        combined_taxable = realized_pnl + unrealized_pnl
+        estimated_total_tax = max(0.0, combined_taxable * tax_rate)
+        estimated_unrealized_tax = max(0.0, estimated_total_tax - total_tax_paid)
+        # Also deduct estimated sell fee on current holdings for strict net liquidation value
+        est_exit_fees = holdings_value * fee_rate
+        after_tax_equity = total_equity - est_exit_fees - estimated_unrealized_tax
+
         init_cap = float(portfolio["initial_capital"])
-        net_pnl = total_equity - init_cap
+        net_pnl = after_tax_equity - init_cap
         return_pct = (net_pnl / init_cap * 100.0) if init_cap > 0 else 0.0
+        gross_pnl_before_tax = (total_equity + total_tax_paid) - init_cap
 
         sell_trades = [t for t in trades if t["side"] == "SELL"]
         wins = [t for t in sell_trades if float(t["realized_pnl"]) > 0]
@@ -447,12 +534,18 @@ class Storage:
             "initial_capital": round(init_cap, 1),
             "cash": round(float(portfolio["cash"]), 1),
             "holdings_value": round(holdings_value, 1),
-            "total_equity": round(total_equity, 1),
+            "total_equity": round(after_tax_equity, 1),
+            "pre_tax_equity": round(total_equity + total_tax_paid, 1),
             "net_pnl": round(net_pnl, 1),
+            "gross_pnl_before_tax": round(gross_pnl_before_tax, 1),
             "return_pct": round(return_pct, 2),
-            "realized_pnl": round(float(portfolio["realized_pnl"]), 1),
+            "realized_pnl": round(realized_pnl, 1),
             "unrealized_pnl": round(unrealized_pnl, 1),
             "total_fees": round(float(portfolio["total_fees"]), 1),
+            "total_tax": round(total_tax_paid + estimated_unrealized_tax, 1),
+            "realized_tax_paid": round(total_tax_paid, 1),
+            "tax_rate": tax_rate,
+            "fee_rate": fee_rate,
             "trade_count": len(trades),
             "closed_trades": len(sell_trades),
             "win_rate": round(win_rate, 1),
@@ -461,6 +554,7 @@ class Storage:
             "last_bar_ts": portfolio["last_bar_ts"],
             "updated_at": signals["updated_at"] or portfolio["updated_at"],
             "positions": positions,
+            "pending_orders": pending_orders,
             "sell_evaluations": signals["sell_evaluations"],
             "recommendations": signals["recommendations"],
             "trades": trades,
@@ -479,7 +573,6 @@ class Storage:
             patterns_by_id[pattern.id] = self.build_pattern_summary(pattern)
             pattern_order.append(pattern.id)
 
-        # Backward-compatible aliases (first lot1 / lot100 pattern)
         first_lot1 = next((p.id for p in cfg.patterns if p.unit_size == 1), pattern_order[0] if pattern_order else None)
         first_lot100 = next((p.id for p in cfg.patterns if p.unit_size >= 100), first_lot1)
         modes_compat: dict[str, Any] = {}
@@ -491,6 +584,7 @@ class Storage:
         snapshot = {
             "generated_at": now_jst().isoformat(),
             "market_status": tse_market_status(),
+            "execution_policy": "事前予測(t足確定) → 次足(t+1)始値約定 / 手数料＋譲渡益課税(約20.315%)控除",
             "config": {
                 "initial_capital": cfg.initial_capital,
                 "interval": cfg.interval,
@@ -498,6 +592,7 @@ class Storage:
                 "max_positions": cfg.max_positions,
                 "max_allocation_pct": cfg.max_allocation_pct,
                 "fee_rate": cfg.fee_rate,
+                "tax_rate": cfg.tax_rate,
                 "slippage_bps": cfg.slippage_bps,
                 "take_profit_pct": cfg.take_profit_pct,
                 "stop_loss_pct": cfg.stop_loss_pct,

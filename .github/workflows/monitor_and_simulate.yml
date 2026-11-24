@@ -26,6 +26,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -65,15 +68,25 @@ jobs:
 
           if [ -n "$DASHBOARD_PASSPHRASE" ]; then
             python -m kabushiki.runner encrypt-state --remove-plaintext
-            git rm -f --ignore-unmatch data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
-            git add data/kabushiki.db.enc web/data/dashboard_snapshot.enc.json
+            git rm -f --ignore-unmatch data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json || true
+            git add -f data/kabushiki.db.enc web/data/dashboard_snapshot.enc.json
           else
-            git add data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
+            git add -f data/kabushiki.db data/dashboard_snapshot.json web/data/dashboard_snapshot.json
           fi
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."
-          else
-            git commit -m "chore(sim): update multi-pattern JP stock simulation"
-            git push
+            exit 0
           fi
+
+          git commit -m "chore(sim): update multi-pattern JP stock simulation"
+
+          # Retry push safely if another run committed in between
+          for attempt in 1 2 3; do
+            if git push origin main; then
+              exit 0
+            fi
+            echo "Push conflict on attempt $attempt; rebasing and retrying..."
+            git pull --rebase origin main || exit 1
+          done
+          exit 1

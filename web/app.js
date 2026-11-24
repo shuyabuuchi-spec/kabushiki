@@ -418,21 +418,21 @@ function renderDashboard() {
   document.getElementById("selectedPatternMeta").textContent =
     `初期資金 ${fmtJPY(p.initial_capital)} ｜ ${p.interval || "15m"}足 ｜ ${p.unit_size}株単位 ｜ 最大${pat.max_positions ?? 3}銘柄 ｜ 買いスコア≥${pat.buy_score_threshold ?? 66} / 売り≤${pat.sell_score_threshold ?? 30} ｜ 利確+${((pat.take_profit_pct ?? 0.035) * 100).toFixed(1)}% / 損切-${((pat.stop_loss_pct ?? 0.02) * 100).toFixed(1)}% ｜ 最新足: ${fmtTime(p.last_bar_ts)}`;
 
-  document.getElementById("kpiCapitalLabel").textContent = `現在の総資産（元手 ${fmtJPY(p.initial_capital)}）`;
+  document.getElementById("kpiCapitalLabel").textContent = `税引後・手取り純資産（元手 ${fmtJPY(p.initial_capital)}）`;
 
   const eqEl = document.getElementById("kpiTotalEquity");
   eqEl.textContent = fmtJPY(p.total_equity);
   eqEl.className = `kpi-value ${p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : ""}`;
 
   const pnlEl = document.getElementById("kpiNetPnl");
-  pnlEl.textContent = `損益 ${fmtSignedJPY(p.net_pnl)} (${fmtPct(p.return_pct)})`;
+  pnlEl.textContent = `手取り損益 ${fmtSignedJPY(p.net_pnl)} (${fmtPct(p.return_pct)})`;
   pnlEl.className = `kpi-sub ${p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : ""}`;
 
   const realEl = document.getElementById("kpiRealizedPnl");
   realEl.textContent = fmtSignedJPY(p.realized_pnl);
   realEl.className = `kpi-value ${p.realized_pnl > 0 ? "up" : p.realized_pnl < 0 ? "down" : ""}`;
   document.getElementById("kpiUnrealizedPnl").textContent =
-    `含み損益: ${fmtSignedJPY(p.unrealized_pnl)} / 手数料計 ${fmtJPY(p.total_fees)}`;
+    `含み損益: ${fmtSignedJPY(p.unrealized_pnl)} ｜ 手数料 ${fmtJPY(p.total_fees)} ｜ 税控除 ${fmtJPY(p.total_tax || 0)}`;
 
   document.getElementById("kpiCash").textContent = fmtJPY(p.cash);
   document.getElementById("kpiHoldings").textContent =
@@ -442,10 +442,45 @@ function renderDashboard() {
   document.getElementById("kpiStats").textContent =
     `決済 ${p.closed_trades}回 / PF ${Number(p.profit_factor || 0).toFixed(2)} / 最大DD -${Number(p.max_drawdown_pct || 0).toFixed(2)}%`;
 
+  renderPendingOrders(p.pending_orders || [], p.interval || "15m");
   renderEquitySVG("liveEquityChart", p.equity_history, p.initial_capital);
   renderSellEvaluations(p.sell_evaluations || [], p.positions || []);
   renderRecommendations(p.recommendations || []);
   renderTrades("tradesBody", p.trades || []);
+}
+
+function renderPendingOrders(orders, interval) {
+  const container = document.getElementById("pendingOrdersContainer");
+  if (!container) return;
+  if (!orders || orders.length === 0) {
+    container.innerHTML = `<div class="empty-state">現在予約されている次回売買提案はありません（条件を満たす銘柄が出ると、次の ${escapeHtml(interval)}足 始値での売買予約としてここに表示されます）。</div>`;
+    return;
+  }
+  container.innerHTML = orders
+    .map((o) => {
+      const isBuy = o.side === "BUY";
+      const badge = isBuy
+        ? `<span class="badge badge-strong-buy">次回 買い予約 (BUY)</span>`
+        : `<span class="badge badge-sell">次回 売り予約 (SELL)</span>`;
+      return `
+        <div class="sell-item ${isBuy ? "" : "urgent"}">
+          <div class="sell-item-top">
+            <div>
+              <span class="sell-title">${escapeHtml(o.name)}</span>
+              <span class="stock-meta">(${escapeHtml(o.symbol)} / スコア ${Number(o.score || 0).toFixed(1)})</span>
+            </div>
+            ${badge}
+          </div>
+          <div class="sell-metrics">
+            <span>事前予測時刻: <b>${escapeHtml(fmtTime(o.signal_time))}</b> → 次の ${escapeHtml(interval)}足 始値で約定予定</span>
+            <span>提案時株価: <b>${fmtPrice(o.signal_price)}</b></span>
+            <span>利確目安 ${fmtPrice(o.target_price)} / 損切り ${fmtPrice(o.stop_loss_price)}</span>
+          </div>
+          <div class="sell-reason">📌 ${escapeHtml(o.reason)}</div>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function renderSellEvaluations(evals, positions) {
@@ -561,7 +596,7 @@ function renderRecommendations(recs) {
 function renderTrades(tbodyId, trades) {
   const tbody = document.getElementById(tbodyId);
   if (!trades || trades.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-cell">売買履歴はまだありません。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-cell">売買履歴はまだありません。</td></tr>`;
     return;
   }
 
@@ -575,13 +610,17 @@ function renderTrades(tbodyId, trades) {
       const pnlText = isBuy
         ? "--"
         : `<span class="${t.realized_pnl >= 0 ? "up" : "down"}"><b>${fmtSignedJPY(t.realized_pnl)}</b></span>`;
+      const sigPart = t.signal_time ? `${fmtTime(t.signal_time)} → ` : "";
+      const taxVal = Number(t.tax || 0);
+      const taxText = taxVal === 0 ? "税¥0" : `税${taxVal > 0 ? "-" : "+"}¥${Math.abs(Math.round(taxVal)).toLocaleString("ja-JP")}`;
       return `
         <tr>
-          <td>${escapeHtml(fmtTime(t.timestamp))}</td>
+          <td><span class="stock-meta">${escapeHtml(sigPart)}</span><b>${escapeHtml(fmtTime(t.timestamp))}</b></td>
           <td>${sideBadge}</td>
           <td><b>${escapeHtml(t.name)}</b> <span class="stock-meta">${escapeHtml(t.symbol)}</span></td>
           <td>${Number(t.quantity).toLocaleString("ja-JP")}株</td>
           <td>${fmtPrice(t.price)}</td>
+          <td><span class="stock-meta">手数料¥${Math.round(Number(t.fee || 0)).toLocaleString("ja-JP")} / ${taxText}</span></td>
           <td>${pnlText}</td>
           <td>${escapeHtml(t.reason)}</td>
         </tr>
@@ -774,7 +813,7 @@ function renderSingleBacktest(res) {
 
   document.getElementById("btSummaryCards").innerHTML = `
     <div class="bt-stat">
-      <div class="bt-stat-label">最終資産 (元手 ${fmtJPY(res.initial_capital)})</div>
+      <div class="bt-stat-label">税引後最終資産 (元手 ${fmtJPY(res.initial_capital)})</div>
       <div class="bt-stat-val ${pnlCls}">${fmtJPY(res.final_equity)}</div>
       <div class="stock-meta ${pnlCls}">${fmtSignedJPY(res.net_pnl)} (${fmtPct(res.return_pct)})</div>
     </div>
@@ -784,9 +823,9 @@ function renderSingleBacktest(res) {
       <div class="stock-meta">総取引 ${res.total_trades}回 (決済 ${res.closed_trades}回)</div>
     </div>
     <div class="bt-stat">
-      <div class="bt-stat-label">最大ドローダウン</div>
+      <div class="bt-stat-label">最大ドローダウン / コスト</div>
       <div class="bt-stat-val down">-${Number(res.max_drawdown_pct).toFixed(2)}%</div>
-      <div class="stock-meta">手数料計 ${fmtJPY(res.total_fees)}</div>
+      <div class="stock-meta">手数料 ${fmtJPY(res.total_fees)} / 税控除 ${fmtJPY(res.total_tax || 0)}</div>
     </div>
     <div class="bt-stat">
       <div class="bt-stat-label">同期間 日経平均 (^N225)</div>
@@ -840,6 +879,8 @@ function openPatternModal(patternId = null, duplicate = false) {
   form.stop_loss_pct.value = ((pat ? pat.stop_loss_pct : 0.02) * 100).toFixed(1);
   form.trailing_activation_pct.value = ((pat ? pat.trailing_activation_pct : 0.015) * 100).toFixed(1);
   form.trailing_stop_pct.value = ((pat ? pat.trailing_stop_pct : 0.01) * 100).toFixed(1);
+  form.fee_rate.value = ((pat ? pat.fee_rate : 0.001) * 100).toFixed(2);
+  form.tax_rate.value = ((pat ? pat.tax_rate : 0.20315) * 100).toFixed(3);
   form.slippage_bps.value = pat ? pat.slippage_bps : 5;
   form.close_before_eod.checked = pat ? Boolean(pat.close_before_eod) : false;
   form.enabled.checked = pat ? Boolean(pat.enabled) : true;
@@ -869,6 +910,8 @@ async function savePatternForm(e) {
     stop_loss_pct: Number(form.stop_loss_pct.value) / 100,
     trailing_activation_pct: Number(form.trailing_activation_pct.value) / 100,
     trailing_stop_pct: Number(form.trailing_stop_pct.value) / 100,
+    fee_rate: Number(form.fee_rate.value) / 100,
+    tax_rate: Number(form.tax_rate.value) / 100,
     slippage_bps: Number(form.slippage_bps.value),
     close_before_eod: form.close_before_eod.checked,
     enabled: form.enabled.checked,

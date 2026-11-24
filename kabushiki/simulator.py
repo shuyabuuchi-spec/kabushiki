@@ -1,4 +1,4 @@
-"""Paper-trading simulator, PC-OFF catch-up engine, and parallel multi-pattern backtester."""
+"""Strict zero-lookahead paper-trading simulator with pre-order predictions, fees, and 20% Japanese tax."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 import math
 import pandas as pd
 
-from .advisor import score_stock, evaluate_sell_timing, StockRecommendation, SellEvaluation
+from .advisor import score_stock, evaluate_sell_timing, StockRecommendation, SellEvaluation, _round_jpy
 from .config import AppConfig, SimulationPattern, MODE_UNIT_SIZE, MODE_LABELS, StockInfo
 from .indicators import compute_indicators, extract_latest_snapshot
 from .market_data import JST, MarketDataProvider, now_jst
@@ -31,7 +31,7 @@ def _compute_order_quantity(
     fee_rate: float,
     slippage_bps: float,
 ) -> int:
-    """Compute tradable share quantity respecting unit_size (1 or 100) and cash."""
+    """Compute tradable share quantity respecting unit_size (1 or 100), fees, and cash."""
     exec_price = _apply_slippage(price, "BUY", slippage_bps)
     if exec_price <= 0:
         return 0
@@ -49,8 +49,88 @@ def _compute_order_quantity(
     return max(0, lots * unit_size)
 
 
+def _apply_realized_tax(
+    net_realized_pnl: float,
+    cumulative_realized_pnl: float,
+    total_tax_paid: float,
+    tax_rate: float,
+) -> tuple[float, float, float]:
+    """Compute Japanese Specific Account (特定口座・源泉徴収あり) tax withholding / loss-offset refund.
+
+    Returns: (new_cumulative_realized_pnl, new_total_tax_paid, tax_delta_charged_to_cash)
+    """
+    new_cum = cumulative_realized_pnl + net_realized_pnl
+    required_tax = max(0.0, new_cum * tax_rate)
+    tax_delta = required_tax - total_tax_paid
+    return new_cum, required_tax, tax_delta
+
+
+def _compute_after_tax_equity(
+    cash: float,
+    positions: dict[str, dict[str, Any]],
+    cumulative_realized_pnl: float,
+    total_tax_paid: float,
+    fee_rate: float,
+    tax_rate: float,
+) -> tuple[float, float, float, float]:
+    """Return (holdings_value, unrealized_pnl_net_of_fees, est_unrealized_tax, after_tax_equity)."""
+    holdings_value = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
+    unrealized_pnl = sum(
+        (float(p["last_price"]) - float(p["avg_cost"])) * int(p["quantity"])
+        - float(p.get("buy_fee", 0.0))
+        - float(p["last_price"]) * int(p["quantity"]) * fee_rate
+        for p in positions.values()
+    )
+    est_exit_fees = holdings_value * fee_rate
+    combined_taxable = cumulative_realized_pnl + unrealized_pnl
+    est_total_tax = max(0.0, combined_taxable * tax_rate)
+    est_unrealized_tax = max(0.0, est_total_tax - total_tax_paid)
+    after_tax_equity = cash + holdings_value - est_exit_fees - est_unrealized_tax
+    return holdings_value, unrealized_pnl, est_unrealized_tax, after_tax_equity
+
+
+def _check_preplaced_exit_during_bar(
+    pos: dict[str, Any],
+    bar_open: float,
+    bar_high: float,
+    bar_low: float,
+    strategy_cfg: AppConfig,
+) -> tuple[float, str] | None:
+    """Check pre-placed stop-loss / trailing-stop / take-profit orders strictly without intrabar lookahead.
+
+    Trailing stop uses `highest_price` strictly from prior bars (or entry price).
+    Conservatively checks downside stop-loss BEFORE upside take-profit if both occur in the same bar.
+    """
+    entry_price = float(pos["avg_cost"])
+    prior_high = float(pos["highest_price"])
+    stop_loss = float(pos["stop_loss_price"])
+    target_price = float(pos["target_price"])
+
+    peak_gain_pct = ((prior_high - entry_price) / entry_price) if entry_price > 0 else 0.0
+    trailing_stop: float | None = None
+    if peak_gain_pct >= strategy_cfg.trailing_activation_pct:
+        trailing_stop = _round_jpy(prior_high * (1.0 - strategy_cfg.trailing_stop_pct))
+
+    # 1. Pre-placed Stop-Loss (逆指値)
+    if bar_low <= stop_loss:
+        trigger_px = min(bar_open, stop_loss)
+        return trigger_px, f"逆指値損切り約定 (設定¥{stop_loss:,.1f} / 安値¥{bar_low:,.1f})"
+
+    # 2. Pre-placed Trailing Stop (トレーリング逆指値)
+    if trailing_stop is not None and bar_low <= trailing_stop:
+        trigger_px = min(bar_open, trailing_stop)
+        return trigger_px, f"トレーリング逆指値約定 (設定¥{trailing_stop:,.1f} / 高値¥{prior_high:,.1f})"
+
+    # 3. Pre-placed Take-Profit (指値利確)
+    if bar_high >= target_price:
+        trigger_px = max(bar_open, target_price)
+        return trigger_px, f"指値利確約定 (目標¥{target_price:,.1f} / 高値¥{bar_high:,.1f})"
+
+    return None
+
+
 class TradingSimulator:
-    """Multi-pattern paper-trading simulator with PC-OFF catch-up and parallel backtesting."""
+    """Multi-pattern zero-lookahead simulator with pre-order predictions, fees, and ~20% tax."""
 
     def __init__(
         self,
@@ -97,6 +177,7 @@ class TradingSimulator:
             max_positions=self.cfg.max_positions,
             max_allocation_pct=self.cfg.max_allocation_pct,
             fee_rate=self.cfg.fee_rate,
+            tax_rate=self.cfg.tax_rate,
             slippage_bps=self.cfg.slippage_bps,
             buy_score_threshold=self.cfg.buy_score_threshold,
             strong_buy_threshold=self.cfg.strong_buy_threshold,
@@ -117,7 +198,13 @@ class TradingSimulator:
         watchlist: list[StockInfo],
         ind_map: dict[str, pd.DataFrame],
     ) -> dict[str, Any]:
-        """Process a single bar timestamp chronologically for one pattern portfolio."""
+        """Process one bar strictly chronologically with zero lookahead:
+
+        Phase A: Execute pre-order BUY/SELL proposals generated on prior bar (t-1) at bar t OPEN.
+        Phase B: Check pre-placed brokerage stop-loss / trailing / take-profit orders during bar t.
+        Phase C: At bar t CLOSE, score stocks & queue pre-order proposals for bar t+1 (10-30m ahead).
+        Phase D: Record after-tax, after-fee mark-to-market equity.
+        """
         portfolio = self.storage.ensure_portfolio(
             portfolio_id,
             initial_capital=strategy_cfg.initial_capital,
@@ -126,20 +213,22 @@ class TradingSimulator:
         cash = float(portfolio["cash"])
         realized_pnl_total = float(portfolio["realized_pnl"])
         total_fees = float(portfolio["total_fees"])
+        total_tax_paid = float(portfolio.get("total_tax", 0.0))
         resolved_unit = int(portfolio["unit_size"])
         init_cap = float(portfolio["initial_capital"])
 
-        positions_list = self.storage.get_positions(portfolio_id)
-        positions: dict[str, dict[str, Any]] = {p["symbol"]: p for p in positions_list}
+        positions: dict[str, dict[str, Any]] = {p["symbol"]: p for p in self.storage.get_positions(portfolio_id)}
+        pending_orders = self.storage.get_pending_orders(portfolio_id)
 
         bar_ts_iso = bar_ts.isoformat()
         bar_dt = bar_ts.to_pydatetime()
 
-        recommendations: list[StockRecommendation] = []
+        # Gather exact bar_t OHLCV + indicator snapshots strictly up to bar_ts
+        exact_bars: dict[str, Any] = {}
         latest_snaps: dict[str, Any] = {}
+        recommendations: list[StockRecommendation] = []
         rec_by_sym: dict[str, StockRecommendation] = {}
 
-        # 1. Score every stock using data up to bar_ts (strictly no lookahead!)
         for stock in watchlist:
             ind_df = ind_map.get(stock.symbol)
             if ind_df is None or ind_df.empty:
@@ -147,8 +236,10 @@ class TradingSimulator:
             pos_idx = int(ind_df.index.searchsorted(bar_ts, side="right")) - 1
             if pos_idx < 1:
                 continue
-            sliced = ind_df.iloc[pos_idx - 1 : pos_idx + 1]
-            snap = extract_latest_snapshot(sliced)
+            row = ind_df.iloc[pos_idx]
+            if ind_df.index[pos_idx] == bar_ts:
+                exact_bars[stock.symbol] = row
+            snap = extract_latest_snapshot(ind_df.iloc[pos_idx - 1 : pos_idx + 1])
             if snap is None:
                 continue
             rec = score_stock(stock, snap, strategy_cfg)
@@ -157,82 +248,91 @@ class TradingSimulator:
             rec_by_sym[stock.symbol] = rec
 
         recommendations.sort(key=lambda r: r.score, reverse=True)
-
         executed_trades: list[dict[str, Any]] = []
-        sell_evaluations: list[SellEvaluation] = []
 
-        # 2. Evaluate held positions & execute sells first
-        for sym in list(positions.keys()):
-            pos = positions[sym]
-            snap = latest_snaps.get(sym)
-            rec = rec_by_sym.get(sym)
-            if snap is None or rec is None:
+        # === PHASE A: Execute pre-orders proposed BEFORE bar_ts at bar_ts OPEN ===
+        pending_sells = [o for o in pending_orders if o["side"] == "SELL" and str(o["signal_time"]) < bar_ts_iso]
+        pending_buys = [o for o in pending_orders if o["side"] == "BUY" and str(o["signal_time"]) < bar_ts_iso]
+        pending_buys.sort(key=lambda o: float(o.get("score", 0.0)), reverse=True)
+
+        for order in pending_sells:
+            sym = order["symbol"]
+            if sym not in positions:
                 continue
+            bar_row = exact_bars.get(sym)
+            if bar_row is None:
+                continue
+            pos = positions[sym]
+            open_px = float(bar_row["Open"])
+            exec_price = _apply_slippage(open_px, "SELL", strategy_cfg.slippage_bps)
+            qty = int(pos["quantity"])
+            gross = exec_price * qty
+            sell_fee = gross * strategy_cfg.fee_rate
+            buy_fee = float(pos.get("buy_fee", 0.0))
+            net_pnl = (exec_price - float(pos["avg_cost"])) * qty - sell_fee - buy_fee
 
-            pos["last_price"] = float(snap.close)
-            pos["highest_price"] = max(float(pos["highest_price"]), float(snap.high), float(snap.close))
-            ev = evaluate_sell_timing(pos, rec, snap, strategy_cfg, bar_time=bar_dt)
+            realized_pnl_total, total_tax_paid, tax_delta = _apply_realized_tax(
+                net_pnl, realized_pnl_total, total_tax_paid, strategy_cfg.tax_rate
+            )
+            cash += gross - sell_fee - tax_delta
+            total_fees += sell_fee
 
-            if ev.should_sell:
-                exec_price = _apply_slippage(float(snap.close), "SELL", strategy_cfg.slippage_bps)
-                qty = int(pos["quantity"])
-                gross = exec_price * qty
-                fee = gross * strategy_cfg.fee_rate
-                net_proceeds = gross - fee
-                pnl = (exec_price - float(pos["avg_cost"])) * qty - fee
+            self.storage.record_trade(
+                mode=portfolio_id,
+                timestamp=bar_ts_iso,
+                signal_time=str(order["signal_time"]),
+                symbol=sym,
+                name=pos["name"],
+                side="SELL",
+                quantity=qty,
+                price=round(exec_price, 2),
+                gross_amount=round(gross, 2),
+                fee=round(sell_fee, 2),
+                tax=round(tax_delta, 2),
+                realized_pnl=round(net_pnl, 2),
+                reason=f"[事前売り提案→始値約定] {order['reason']}",
+            )
+            self.storage.delete_position(portfolio_id, sym)
+            del positions[sym]
+            executed_trades.append(
+                {
+                    "timestamp": bar_ts_iso,
+                    "signal_time": str(order["signal_time"]),
+                    "symbol": sym,
+                    "name": pos["name"],
+                    "side": "SELL",
+                    "quantity": qty,
+                    "price": round(exec_price, 2),
+                    "fee": round(sell_fee, 2),
+                    "tax": round(tax_delta, 2),
+                    "realized_pnl": round(net_pnl, 2),
+                    "reason": f"[事前売り提案→始値約定] {order['reason']}",
+                }
+            )
 
-                cash += net_proceeds
-                realized_pnl_total += pnl
-                total_fees += fee
+        holdings_val_open = sum(
+            float(exact_bars[s]["Open"]) * int(p["quantity"])
+            if s in exact_bars
+            else float(p["last_price"]) * int(p["quantity"])
+            for s, p in positions.items()
+        )
+        total_equity_open = cash + holdings_val_open
 
-                self.storage.record_trade(
-                    mode=portfolio_id,
-                    timestamp=bar_ts_iso,
-                    symbol=sym,
-                    name=pos["name"],
-                    side="SELL",
-                    quantity=qty,
-                    price=round(exec_price, 2),
-                    gross_amount=round(gross, 2),
-                    fee=round(fee, 2),
-                    realized_pnl=round(pnl, 2),
-                    reason=ev.primary_reason,
-                )
-                self.storage.delete_position(portfolio_id, sym)
-                del positions[sym]
-                executed_trades.append(
-                    {
-                        "timestamp": bar_ts_iso,
-                        "symbol": sym,
-                        "name": pos["name"],
-                        "side": "SELL",
-                        "quantity": qty,
-                        "price": round(exec_price, 2),
-                        "realized_pnl": round(pnl, 2),
-                        "reason": ev.primary_reason,
-                    }
-                )
-            else:
-                self.storage.upsert_position(portfolio_id, pos)
-                sell_evaluations.append(ev)
-
-        # 3. Evaluate buy candidates
-        holdings_val_pre_buy = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
-        total_equity_pre_buy = cash + holdings_val_pre_buy
-
-        for rec in recommendations:
+        for order in pending_buys:
             if len(positions) >= strategy_cfg.max_positions:
                 break
-            if rec.symbol in positions:
+            sym = order["symbol"]
+            if sym in positions:
                 continue
-            if rec.action not in ("STRONG_BUY", "BUY"):
+            bar_row = exact_bars.get(sym)
+            if bar_row is None:
                 continue
 
-            snap = latest_snaps[rec.symbol]
+            open_px = float(bar_row["Open"])
             qty = _compute_order_quantity(
-                price=float(snap.close),
+                price=open_px,
                 cash=cash,
-                total_equity=total_equity_pre_buy,
+                total_equity=total_equity_open,
                 unit_size=resolved_unit,
                 max_allocation_pct=strategy_cfg.max_allocation_pct,
                 fee_rate=strategy_cfg.fee_rate,
@@ -241,68 +341,213 @@ class TradingSimulator:
             if qty <= 0:
                 continue
 
-            exec_price = _apply_slippage(float(snap.close), "BUY", strategy_cfg.slippage_bps)
+            exec_price = _apply_slippage(open_px, "BUY", strategy_cfg.slippage_bps)
             gross = exec_price * qty
-            fee = gross * strategy_cfg.fee_rate
-            total_cost = gross + fee
+            buy_fee = gross * strategy_cfg.fee_rate
+            total_cost = gross + buy_fee
             if total_cost > cash:
                 continue
 
             cash -= total_cost
-            total_fees += fee
-            reason = f"{rec.action_label} (スコア {rec.score:.1f}): " + " / ".join(rec.reasons[:2])
+            total_fees += buy_fee
+
+            # Anchor take-profit and stop-loss around actual execution price
+            sig_px = float(order.get("signal_price") or exec_price)
+            tp_ratio = (float(order["target_price"]) / sig_px) if sig_px > 0 and float(order.get("target_price", 0)) > 0 else (1.0 + strategy_cfg.take_profit_pct)
+            sl_ratio = (float(order["stop_loss_price"]) / sig_px) if sig_px > 0 and float(order.get("stop_loss_price", 0)) > 0 else (1.0 - strategy_cfg.stop_loss_pct)
+            target_px = _round_jpy(exec_price * max(1.005, tp_ratio))
+            stop_px = _round_jpy(max(1.0, exec_price * min(0.995, sl_ratio)))
 
             new_pos = {
-                "symbol": rec.symbol,
-                "name": rec.name,
+                "symbol": sym,
+                "name": order["name"],
                 "quantity": qty,
                 "avg_cost": round(exec_price, 2),
+                "buy_fee": round(buy_fee, 2),
                 "highest_price": round(exec_price, 2),
-                "target_price": rec.target_price,
-                "stop_loss_price": rec.stop_loss_price,
+                "target_price": target_px,
+                "stop_loss_price": stop_px,
                 "entry_time": bar_ts_iso,
-                "last_price": float(snap.close),
+                "last_price": open_px,
             }
-            positions[rec.symbol] = new_pos
+            positions[sym] = new_pos
             self.storage.upsert_position(portfolio_id, new_pos)
             self.storage.record_trade(
                 mode=portfolio_id,
                 timestamp=bar_ts_iso,
-                symbol=rec.symbol,
-                name=rec.name,
+                signal_time=str(order["signal_time"]),
+                symbol=sym,
+                name=order["name"],
                 side="BUY",
                 quantity=qty,
                 price=round(exec_price, 2),
                 gross_amount=round(gross, 2),
-                fee=round(fee, 2),
+                fee=round(buy_fee, 2),
+                tax=0.0,
                 realized_pnl=0.0,
-                reason=reason,
+                reason=f"[事前買い予測→始値約定] {order['reason']}",
             )
             executed_trades.append(
                 {
                     "timestamp": bar_ts_iso,
-                    "symbol": rec.symbol,
-                    "name": rec.name,
+                    "signal_time": str(order["signal_time"]),
+                    "symbol": sym,
+                    "name": order["name"],
                     "side": "BUY",
                     "quantity": qty,
                     "price": round(exec_price, 2),
+                    "fee": round(buy_fee, 2),
+                    "tax": 0.0,
                     "realized_pnl": 0.0,
-                    "reason": reason,
+                    "reason": f"[事前買い予測→始値約定] {order['reason']}",
                 }
             )
-            ev_new = evaluate_sell_timing(new_pos, rec, snap, strategy_cfg, bar_time=bar_dt)
-            sell_evaluations.append(ev_new)
 
-        # 4. Mark-to-market & persist equity curve point
-        holdings_value = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
-        total_equity = cash + holdings_value
-        return_pct = ((total_equity - init_cap) / init_cap * 100.0) if init_cap > 0 else 0.0
+        # === PHASE B: Check pre-placed brokerage stop-loss / trailing / take-profit during bar_ts ===
+        for sym in list(positions.keys()):
+            pos = positions[sym]
+            bar_row = exact_bars.get(sym)
+            if bar_row is None:
+                continue
+            b_open = float(bar_row["Open"])
+            b_high = float(bar_row["High"])
+            b_low = float(bar_row["Low"])
+            b_close = float(bar_row["Close"])
+
+            hit = _check_preplaced_exit_during_bar(pos, b_open, b_high, b_low, strategy_cfg)
+            if hit is not None:
+                trigger_px, hit_reason = hit
+                exec_price = _apply_slippage(trigger_px, "SELL", strategy_cfg.slippage_bps)
+                qty = int(pos["quantity"])
+                gross = exec_price * qty
+                sell_fee = gross * strategy_cfg.fee_rate
+                buy_fee = float(pos.get("buy_fee", 0.0))
+                net_pnl = (exec_price - float(pos["avg_cost"])) * qty - sell_fee - buy_fee
+
+                realized_pnl_total, total_tax_paid, tax_delta = _apply_realized_tax(
+                    net_pnl, realized_pnl_total, total_tax_paid, strategy_cfg.tax_rate
+                )
+                cash += gross - sell_fee - tax_delta
+                total_fees += sell_fee
+
+                self.storage.record_trade(
+                    mode=portfolio_id,
+                    timestamp=bar_ts_iso,
+                    signal_time=str(pos["entry_time"]),
+                    symbol=sym,
+                    name=pos["name"],
+                    side="SELL",
+                    quantity=qty,
+                    price=round(exec_price, 2),
+                    gross_amount=round(gross, 2),
+                    fee=round(sell_fee, 2),
+                    tax=round(tax_delta, 2),
+                    realized_pnl=round(net_pnl, 2),
+                    reason=hit_reason,
+                )
+                self.storage.delete_position(portfolio_id, sym)
+                del positions[sym]
+                executed_trades.append(
+                    {
+                        "timestamp": bar_ts_iso,
+                        "signal_time": str(pos["entry_time"]),
+                        "symbol": sym,
+                        "name": pos["name"],
+                        "side": "SELL",
+                        "quantity": qty,
+                        "price": round(exec_price, 2),
+                        "fee": round(sell_fee, 2),
+                        "tax": round(tax_delta, 2),
+                        "realized_pnl": round(net_pnl, 2),
+                        "reason": hit_reason,
+                    }
+                )
+            else:
+                pos["last_price"] = b_close
+                pos["highest_price"] = max(float(pos["highest_price"]), b_high, b_close)
+                self.storage.upsert_position(portfolio_id, pos)
+
+        # === PHASE C: Bar t CLOSE -> Generate Pre-Order Proposals for Next Bar (t+1) ===
+        sell_evaluations: list[SellEvaluation] = []
+        next_pending: list[dict[str, Any]] = []
+
+        for sym, pos in positions.items():
+            snap = latest_snaps.get(sym)
+            rec = rec_by_sym.get(sym)
+            if snap is None or rec is None:
+                continue
+            ev = evaluate_sell_timing(pos, rec, snap, strategy_cfg, bar_time=bar_dt)
+            sell_evaluations.append(ev)
+            if ev.should_sell:
+                next_pending.append(
+                    {
+                        "symbol": sym,
+                        "name": pos["name"],
+                        "side": "SELL",
+                        "signal_time": bar_ts_iso,
+                        "signal_price": float(snap.close),
+                        "score": rec.score,
+                        "target_price": ev.target_price,
+                        "stop_loss_price": ev.stop_loss_price,
+                        "reason": ev.primary_reason,
+                    }
+                )
+
+        # Estimate available slots after queued sells
+        queued_sell_syms = {o["symbol"] for o in next_pending if o["side"] == "SELL"}
+        expected_open_after_sells = len(positions) - len(queued_sell_syms)
+        slots_to_propose = max(0, strategy_cfg.max_positions - expected_open_after_sells)
+
+        proposed_buys = 0
+        for rec in recommendations:
+            if proposed_buys >= slots_to_propose:
+                break
+            if rec.symbol in positions:
+                continue
+            if rec.action not in ("STRONG_BUY", "BUY"):
+                continue
+            # Check affordability conservatively against current cash + expected proceeds
+            snap = latest_snaps.get(rec.symbol)
+            if snap is None:
+                continue
+            unit_cost = float(snap.close) * resolved_unit * (1.0 + strategy_cfg.fee_rate)
+            est_cash = cash + sum(float(positions[s]["last_price"]) * int(positions[s]["quantity"]) for s in queued_sell_syms)
+            if unit_cost > est_cash:
+                continue
+            next_pending.append(
+                {
+                    "symbol": rec.symbol,
+                    "name": rec.name,
+                    "side": "BUY",
+                    "signal_time": bar_ts_iso,
+                    "signal_price": float(snap.close),
+                    "score": rec.score,
+                    "target_price": rec.target_price,
+                    "stop_loss_price": rec.stop_loss_price,
+                    "reason": f"{rec.action_label} (スコア {rec.score:.1f}): " + " / ".join(rec.reasons[:2]),
+                }
+            )
+            proposed_buys += 1
+
+        self.storage.replace_pending_orders(portfolio_id, next_pending)
+
+        # === PHASE D: Mark-to-market After-Tax Equity ===
+        holdings_value, unrealized_pnl, est_unr_tax, after_tax_equity = _compute_after_tax_equity(
+            cash=cash,
+            positions=positions,
+            cumulative_realized_pnl=realized_pnl_total,
+            total_tax_paid=total_tax_paid,
+            fee_rate=strategy_cfg.fee_rate,
+            tax_rate=strategy_cfg.tax_rate,
+        )
+        return_pct = ((after_tax_equity - init_cap) / init_cap * 100.0) if init_cap > 0 else 0.0
 
         self.storage.update_portfolio(
             mode=portfolio_id,
             cash=round(cash, 2),
             realized_pnl=round(realized_pnl_total, 2),
             total_fees=round(total_fees, 2),
+            total_tax=round(total_tax_paid, 2),
             last_bar_ts=bar_ts_iso,
         )
         self.storage.record_equity_point(
@@ -310,7 +555,7 @@ class TradingSimulator:
             timestamp=bar_ts_iso,
             cash=cash,
             holdings_value=holdings_value,
-            total_equity=total_equity,
+            total_equity=after_tax_equity,
             return_pct=return_pct,
             open_positions=len(positions),
         )
@@ -327,9 +572,12 @@ class TradingSimulator:
             "pattern_id": portfolio_id,
             "mode": portfolio_id,
             "bar_ts": bar_ts_iso,
-            "total_equity": round(total_equity, 1),
+            "total_equity": round(after_tax_equity, 1),
             "return_pct": round(return_pct, 2),
+            "total_fees": round(total_fees, 1),
+            "total_tax": round(total_tax_paid + est_unr_tax, 1),
             "trades_executed": executed_trades,
+            "pending_orders_count": len(next_pending),
             "open_positions": len(positions),
             "recommendation_count": len(recommendations),
         }
@@ -415,6 +663,9 @@ class TradingSimulator:
             "latest_bar": target_ts[-1].isoformat() if target_ts else last_bar_ts_str,
             "total_equity": last_res.get("total_equity"),
             "return_pct": last_res.get("return_pct"),
+            "total_fees": last_res.get("total_fees"),
+            "total_tax": last_res.get("total_tax"),
+            "pending_orders_count": last_res.get("pending_orders_count"),
         }
 
     def run_catchup_all_patterns(
@@ -432,7 +683,6 @@ class TradingSimulator:
         if not targets:
             return []
 
-        # Group required symbols by interval so Yahoo Finance is only queried once per interval
         interval_symbols: dict[str, set[str]] = defaultdict(set)
         for p in targets:
             iv = override_interval or p.interval
@@ -587,7 +837,7 @@ class TradingSimulator:
         preloaded_data: dict[str, pd.DataFrame] | None = None,
         benchmark_df: pd.DataFrame | None = None,
     ) -> dict[str, Any]:
-        """Run an isolated in-memory backtest for a specific SimulationPattern."""
+        """Run an isolated strict zero-lookahead backtest (pre-order at t -> execute at t+1 Open, after fees & 20% tax)."""
         init_cap = float(override_capital if override_capital is not None else pattern.initial_capital)
         use_interval = override_interval or pattern.interval
         unit_size = pattern.unit_size
@@ -621,7 +871,9 @@ class TradingSimulator:
         cash = init_cap
         realized_pnl_total = 0.0
         total_fees = 0.0
+        total_tax_paid = 0.0
         positions: dict[str, dict[str, Any]] = {}
+        pending_orders: list[dict[str, Any]] = []
         trades: list[dict[str, Any]] = []
         equity_curve: list[dict[str, Any]] = []
 
@@ -634,6 +886,8 @@ class TradingSimulator:
         for bar_ts in sim_timestamps:
             bar_ts_iso = bar_ts.isoformat()
             bar_dt = bar_ts.to_pydatetime()
+
+            exact_bars: dict[str, Any] = {}
             recs: list[StockRecommendation] = []
             snaps: dict[str, Any] = {}
             rec_by_sym: dict[str, StockRecommendation] = {}
@@ -645,6 +899,7 @@ class TradingSimulator:
                 idx = sym_ts_pos[stock.symbol].get(bar_ts)
                 if idx is not None:
                     last_known_idx[stock.symbol] = idx
+                    exact_bars[stock.symbol] = ind_df.iloc[idx]
                 else:
                     idx = last_known_idx.get(stock.symbol)
                 if idx is None or idx < 1:
@@ -660,53 +915,70 @@ class TradingSimulator:
 
             recs.sort(key=lambda r: r.score, reverse=True)
 
-            # Evaluate sells
-            for sym in list(positions.keys()):
-                pos = positions[sym]
-                snap = snaps.get(sym)
-                rec = rec_by_sym.get(sym)
-                if snap is None or rec is None:
-                    continue
-                pos["last_price"] = float(snap.close)
-                pos["highest_price"] = max(float(pos["highest_price"]), float(snap.high), float(snap.close))
-                ev = evaluate_sell_timing(pos, rec, snap, strategy_cfg, bar_time=bar_dt)
-                if ev.should_sell:
-                    exec_price = _apply_slippage(float(snap.close), "SELL", strategy_cfg.slippage_bps)
-                    qty = int(pos["quantity"])
-                    gross = exec_price * qty
-                    fee = gross * strategy_cfg.fee_rate
-                    pnl = (exec_price - float(pos["avg_cost"])) * qty - fee
-                    cash += gross - fee
-                    realized_pnl_total += pnl
-                    total_fees += fee
-                    trades.append(
-                        {
-                            "timestamp": bar_ts_iso,
-                            "symbol": sym,
-                            "name": pos["name"],
-                            "side": "SELL",
-                            "quantity": qty,
-                            "price": round(exec_price, 2),
-                            "fee": round(fee, 2),
-                            "realized_pnl": round(pnl, 2),
-                            "reason": ev.primary_reason,
-                        }
-                    )
-                    del positions[sym]
+            # === PHASE A: Execute pre-orders from previous bar at bar_ts OPEN ===
+            pending_sells = [o for o in pending_orders if o["side"] == "SELL" and str(o["signal_time"]) < bar_ts_iso]
+            pending_buys = [o for o in pending_orders if o["side"] == "BUY" and str(o["signal_time"]) < bar_ts_iso]
+            pending_buys.sort(key=lambda o: float(o.get("score", 0.0)), reverse=True)
 
-            # Evaluate buys
-            holdings_val_pre = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
-            total_eq_pre = cash + holdings_val_pre
-            for rec in recs:
+            for order in pending_sells:
+                sym = order["symbol"]
+                if sym not in positions:
+                    continue
+                bar_row = exact_bars.get(sym)
+                if bar_row is None:
+                    continue
+                pos = positions[sym]
+                exec_price = _apply_slippage(float(bar_row["Open"]), "SELL", strategy_cfg.slippage_bps)
+                qty = int(pos["quantity"])
+                gross = exec_price * qty
+                sell_fee = gross * strategy_cfg.fee_rate
+                buy_fee = float(pos.get("buy_fee", 0.0))
+                net_pnl = (exec_price - float(pos["avg_cost"])) * qty - sell_fee - buy_fee
+
+                realized_pnl_total, total_tax_paid, tax_delta = _apply_realized_tax(
+                    net_pnl, realized_pnl_total, total_tax_paid, strategy_cfg.tax_rate
+                )
+                cash += gross - sell_fee - tax_delta
+                total_fees += sell_fee
+                trades.append(
+                    {
+                        "timestamp": bar_ts_iso,
+                        "signal_time": str(order["signal_time"]),
+                        "symbol": sym,
+                        "name": pos["name"],
+                        "side": "SELL",
+                        "quantity": qty,
+                        "price": round(exec_price, 2),
+                        "fee": round(sell_fee, 2),
+                        "tax": round(tax_delta, 2),
+                        "realized_pnl": round(net_pnl, 2),
+                        "reason": f"[事前売り提案→始値約定] {order['reason']}",
+                    }
+                )
+                del positions[sym]
+
+            holdings_val_open = sum(
+                float(exact_bars[s]["Open"]) * int(p["quantity"])
+                if s in exact_bars
+                else float(p["last_price"]) * int(p["quantity"])
+                for s, p in positions.items()
+            )
+            total_eq_open = cash + holdings_val_open
+
+            for order in pending_buys:
                 if len(positions) >= strategy_cfg.max_positions:
                     break
-                if rec.symbol in positions or rec.action not in ("STRONG_BUY", "BUY"):
+                sym = order["symbol"]
+                if sym in positions:
                     continue
-                snap = snaps[rec.symbol]
+                bar_row = exact_bars.get(sym)
+                if bar_row is None:
+                    continue
+                open_px = float(bar_row["Open"])
                 qty = _compute_order_quantity(
-                    price=float(snap.close),
+                    price=open_px,
                     cash=cash,
-                    total_equity=total_eq_pre,
+                    total_equity=total_eq_open,
                     unit_size=unit_size,
                     max_allocation_pct=strategy_cfg.max_allocation_pct,
                     fee_rate=strategy_cfg.fee_rate,
@@ -714,45 +986,160 @@ class TradingSimulator:
                 )
                 if qty <= 0:
                     continue
-                exec_price = _apply_slippage(float(snap.close), "BUY", strategy_cfg.slippage_bps)
+                exec_price = _apply_slippage(open_px, "BUY", strategy_cfg.slippage_bps)
                 gross = exec_price * qty
-                fee = gross * strategy_cfg.fee_rate
-                if gross + fee > cash:
+                buy_fee = gross * strategy_cfg.fee_rate
+                if gross + buy_fee > cash:
                     continue
-                cash -= gross + fee
-                total_fees += fee
-                positions[rec.symbol] = {
-                    "symbol": rec.symbol,
-                    "name": rec.name,
+                cash -= gross + buy_fee
+                total_fees += buy_fee
+
+                sig_px = float(order.get("signal_price") or exec_price)
+                tp_ratio = (float(order["target_price"]) / sig_px) if sig_px > 0 and float(order.get("target_price", 0)) > 0 else (1.0 + strategy_cfg.take_profit_pct)
+                sl_ratio = (float(order["stop_loss_price"]) / sig_px) if sig_px > 0 and float(order.get("stop_loss_price", 0)) > 0 else (1.0 - strategy_cfg.stop_loss_pct)
+                positions[sym] = {
+                    "symbol": sym,
+                    "name": order["name"],
                     "quantity": qty,
                     "avg_cost": round(exec_price, 2),
+                    "buy_fee": round(buy_fee, 2),
                     "highest_price": round(exec_price, 2),
-                    "target_price": rec.target_price,
-                    "stop_loss_price": rec.stop_loss_price,
+                    "target_price": _round_jpy(exec_price * max(1.005, tp_ratio)),
+                    "stop_loss_price": _round_jpy(max(1.0, exec_price * min(0.995, sl_ratio))),
                     "entry_time": bar_ts_iso,
-                    "last_price": float(snap.close),
+                    "last_price": open_px,
                 }
                 trades.append(
                     {
                         "timestamp": bar_ts_iso,
-                        "symbol": rec.symbol,
-                        "name": rec.name,
+                        "signal_time": str(order["signal_time"]),
+                        "symbol": sym,
+                        "name": order["name"],
                         "side": "BUY",
                         "quantity": qty,
                         "price": round(exec_price, 2),
-                        "fee": round(fee, 2),
+                        "fee": round(buy_fee, 2),
+                        "tax": 0.0,
                         "realized_pnl": 0.0,
-                        "reason": f"{rec.action_label} (スコア {rec.score:.1f}): " + " / ".join(rec.reasons[:2]),
+                        "reason": f"[事前買い予測→始値約定] {order['reason']}",
                     }
                 )
 
-            holdings_val = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
-            total_eq = cash + holdings_val
-            ret_pct = (total_eq - init_cap) / init_cap * 100.0
+            # === PHASE B: Check pre-placed stop/limit orders during bar_ts ===
+            for sym in list(positions.keys()):
+                pos = positions[sym]
+                bar_row = exact_bars.get(sym)
+                if bar_row is None:
+                    continue
+                b_open = float(bar_row["Open"])
+                b_high = float(bar_row["High"])
+                b_low = float(bar_row["Low"])
+                b_close = float(bar_row["Close"])
+
+                hit = _check_preplaced_exit_during_bar(pos, b_open, b_high, b_low, strategy_cfg)
+                if hit is not None:
+                    trigger_px, hit_reason = hit
+                    exec_price = _apply_slippage(trigger_px, "SELL", strategy_cfg.slippage_bps)
+                    qty = int(pos["quantity"])
+                    gross = exec_price * qty
+                    sell_fee = gross * strategy_cfg.fee_rate
+                    buy_fee = float(pos.get("buy_fee", 0.0))
+                    net_pnl = (exec_price - float(pos["avg_cost"])) * qty - sell_fee - buy_fee
+
+                    realized_pnl_total, total_tax_paid, tax_delta = _apply_realized_tax(
+                        net_pnl, realized_pnl_total, total_tax_paid, strategy_cfg.tax_rate
+                    )
+                    cash += gross - sell_fee - tax_delta
+                    total_fees += sell_fee
+                    trades.append(
+                        {
+                            "timestamp": bar_ts_iso,
+                            "signal_time": str(pos["entry_time"]),
+                            "symbol": sym,
+                            "name": pos["name"],
+                            "side": "SELL",
+                            "quantity": qty,
+                            "price": round(exec_price, 2),
+                            "fee": round(sell_fee, 2),
+                            "tax": round(tax_delta, 2),
+                            "realized_pnl": round(net_pnl, 2),
+                            "reason": hit_reason,
+                        }
+                    )
+                    del positions[sym]
+                else:
+                    pos["last_price"] = b_close
+                    pos["highest_price"] = max(float(pos["highest_price"]), b_high, b_close)
+
+            # === PHASE C: Bar t CLOSE -> Queue pre-orders for next bar (t+1) ===
+            next_pending: list[dict[str, Any]] = []
+            for sym, pos in positions.items():
+                snap = snaps.get(sym)
+                rec = rec_by_sym.get(sym)
+                if snap is None or rec is None:
+                    continue
+                ev = evaluate_sell_timing(pos, rec, snap, strategy_cfg, bar_time=bar_dt)
+                if ev.should_sell:
+                    next_pending.append(
+                        {
+                            "symbol": sym,
+                            "name": pos["name"],
+                            "side": "SELL",
+                            "signal_time": bar_ts_iso,
+                            "signal_price": float(snap.close),
+                            "score": rec.score,
+                            "target_price": ev.target_price,
+                            "stop_loss_price": ev.stop_loss_price,
+                            "reason": ev.primary_reason,
+                        }
+                    )
+
+            queued_sell_syms = {o["symbol"] for o in next_pending if o["side"] == "SELL"}
+            slots = max(0, strategy_cfg.max_positions - (len(positions) - len(queued_sell_syms)))
+            proposed_buys = 0
+            for rec in recs:
+                if proposed_buys >= slots:
+                    break
+                if rec.symbol in positions or rec.action not in ("STRONG_BUY", "BUY"):
+                    continue
+                snap = snaps.get(rec.symbol)
+                if snap is None:
+                    continue
+                unit_cost = float(snap.close) * unit_size * (1.0 + strategy_cfg.fee_rate)
+                est_cash = cash + sum(float(positions[s]["last_price"]) * int(positions[s]["quantity"]) for s in queued_sell_syms)
+                if unit_cost > est_cash:
+                    continue
+                next_pending.append(
+                    {
+                        "symbol": rec.symbol,
+                        "name": rec.name,
+                        "side": "BUY",
+                        "signal_time": bar_ts_iso,
+                        "signal_price": float(snap.close),
+                        "score": rec.score,
+                        "target_price": rec.target_price,
+                        "stop_loss_price": rec.stop_loss_price,
+                        "reason": f"{rec.action_label} (スコア {rec.score:.1f}): " + " / ".join(rec.reasons[:2]),
+                    }
+                )
+                proposed_buys += 1
+
+            pending_orders = next_pending
+
+            # === PHASE D: Mark-to-market After-Tax Equity ===
+            holdings_val, unrealized_pnl, est_unr_tax, after_tax_eq = _compute_after_tax_equity(
+                cash=cash,
+                positions=positions,
+                cumulative_realized_pnl=realized_pnl_total,
+                total_tax_paid=total_tax_paid,
+                fee_rate=strategy_cfg.fee_rate,
+                tax_rate=strategy_cfg.tax_rate,
+            )
+            ret_pct = (after_tax_eq - init_cap) / init_cap * 100.0
             equity_curve.append(
                 {
                     "timestamp": bar_ts_iso,
-                    "total_equity": round(total_eq, 1),
+                    "total_equity": round(after_tax_eq, 1),
                     "cash": round(cash, 1),
                     "holdings_value": round(holdings_val, 1),
                     "return_pct": round(ret_pct, 2),
@@ -760,13 +1147,18 @@ class TradingSimulator:
                 }
             )
 
-        final_holdings = sum(float(p["last_price"]) * int(p["quantity"]) for p in positions.values())
-        final_equity = cash + final_holdings
-        unrealized_pnl = sum(
-            (float(p["last_price"]) - float(p["avg_cost"])) * int(p["quantity"])
-            for p in positions.values()
+        final_holdings, unrealized_pnl, est_unr_tax, final_after_tax_equity = _compute_after_tax_equity(
+            cash=cash,
+            positions=positions,
+            cumulative_realized_pnl=realized_pnl_total,
+            total_tax_paid=total_tax_paid,
+            fee_rate=strategy_cfg.fee_rate,
+            tax_rate=strategy_cfg.tax_rate,
         )
-        net_pnl = final_equity - init_cap
+        total_tax_all = total_tax_paid + est_unr_tax
+        net_pnl = final_after_tax_equity - init_cap
+        pre_tax_equity = cash + final_holdings + total_tax_paid
+        gross_pnl_before_tax = pre_tax_equity - init_cap
         return_pct = (net_pnl / init_cap * 100.0) if init_cap > 0 else 0.0
 
         sell_trades = [t for t in trades if t["side"] == "SELL"]
@@ -813,19 +1205,25 @@ class TradingSimulator:
             "unit_size": unit_size,
             "interval": use_interval,
             "days": days,
+            "execution_policy": "事前予測(t足) → 次足(t+1)始値約定 / 手数料＋税控除",
             "bars_simulated": len(sim_timestamps),
             "start_time": sim_timestamps[0].isoformat(),
             "end_time": sim_timestamps[-1].isoformat(),
             "symbols_loaded": len(ind_map),
             "initial_capital": round(init_cap, 1),
-            "final_equity": round(final_equity, 1),
+            "final_equity": round(final_after_tax_equity, 1),
+            "pre_tax_equity": round(pre_tax_equity, 1),
             "cash": round(cash, 1),
             "holdings_value": round(final_holdings, 1),
             "net_pnl": round(net_pnl, 1),
+            "gross_pnl_before_tax": round(gross_pnl_before_tax, 1),
             "return_pct": round(return_pct, 2),
             "realized_pnl": round(realized_pnl_total, 1),
             "unrealized_pnl": round(unrealized_pnl, 1),
             "total_fees": round(total_fees, 1),
+            "total_tax": round(total_tax_all, 1),
+            "fee_rate": strategy_cfg.fee_rate,
+            "tax_rate": strategy_cfg.tax_rate,
             "total_trades": len(trades),
             "closed_trades": len(sell_trades),
             "win_rate": round(win_rate, 1),
@@ -833,6 +1231,7 @@ class TradingSimulator:
             "max_drawdown_pct": round(max_dd_pct, 2),
             "benchmark_nikkei225_pct": benchmark_return_pct,
             "open_positions": list(positions.values()),
+            "pending_orders": pending_orders,
             "equity_curve": equity_curve,
             "trades": list(reversed(trades)),
         }
@@ -844,7 +1243,7 @@ class TradingSimulator:
         override_capital: float | None = None,
         override_interval: str | None = None,
     ) -> dict[str, Any]:
-        """Run parallel real-data backtests across multiple patterns and rank them side-by-side."""
+        """Run parallel zero-lookahead real-data backtests across multiple patterns."""
         targets = patterns if patterns is not None else self.cfg.get_enabled_patterns()
         if not targets:
             return {"error": "有効なシミュレーションパターンがありません。"}

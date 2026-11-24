@@ -101,14 +101,14 @@
     <!-- KPI Cards for Selected Pattern -->
     <section class="kpi-grid">
       <div class="card kpi-card highlight">
-        <div class="kpi-label" id="kpiCapitalLabel">現在の総資産（元手 ¥100,000）</div>
+        <div class="kpi-label" id="kpiCapitalLabel">税引後・手取り純資産（元手 ¥100,000）</div>
         <div class="kpi-value" id="kpiTotalEquity">¥100,000</div>
-        <div class="kpi-sub" id="kpiNetPnl">損益 ¥0 (0.00%)</div>
+        <div class="kpi-sub" id="kpiNetPnl">手取り損益 ¥0 (0.00%)</div>
       </div>
       <div class="card kpi-card">
-        <div class="kpi-label">確定損益 / 含み損益</div>
+        <div class="kpi-label">確定損益 / 手数料・税控除(約20.315%)</div>
         <div class="kpi-value" id="kpiRealizedPnl">¥0</div>
-        <div class="kpi-sub" id="kpiUnrealizedPnl">含み損益: ¥0</div>
+        <div class="kpi-sub" id="kpiUnrealizedPnl">含み損益: ¥0 / 手数料 ¥0 / 税 ¥0</div>
       </div>
       <div class="card kpi-card">
         <div class="kpi-label">現金余力 / 保有株評価額</div>
@@ -119,6 +119,19 @@
         <div class="kpi-label">勝率 / PF / 最大DD</div>
         <div class="kpi-value" id="kpiWinRate">0.0%</div>
         <div class="kpi-sub" id="kpiStats">決済 0回 / PF 0.00 / 最大DD -0.00%</div>
+      </div>
+    </section>
+
+    <!-- Pre-Order Predictions Panel (Zero-Lookahead: proposed 10-30m BEFORE next bar Open execution) -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>📌 次回売買の事前予測リスト（購入・売却の10〜30分前提案 → 次足始値で実約定）</h2>
+          <p class="card-desc">未来情報を一切使わず、確定した足だけで事前に購入/売却候補を提案します。次の足（10〜30分後）の始値＋スリッページ＋手数料で自動約定します。</p>
+        </div>
+      </div>
+      <div id="pendingOrdersContainer" class="sell-list">
+        <div class="empty-state">現在予約されている次回売買提案はありません。</div>
       </div>
     </section>
 
@@ -267,12 +280,13 @@
             <table class="data-table compact">
               <thead>
                 <tr>
-                  <th>日時 (JST)</th>
+                  <th>事前予測 → 約定日時</th>
                   <th>売買</th>
                   <th>銘柄</th>
                   <th>株数</th>
                   <th>約定価格</th>
-                  <th>実現損益</th>
+                  <th>手数料 / 税</th>
+                  <th>実現損益(手数料後)</th>
                   <th>理由</th>
                 </tr>
               </thead>
@@ -295,17 +309,18 @@
         <table class="data-table compact">
           <thead>
             <tr>
-              <th>日時 (JST)</th>
+              <th>事前予測 → 約定日時</th>
               <th>売買</th>
               <th>銘柄</th>
               <th>株数</th>
               <th>約定価格</th>
-              <th>実現損益</th>
+              <th>手数料 / 税</th>
+              <th>実現損益(手数料後)</th>
               <th>売買理由</th>
             </tr>
           </thead>
           <tbody id="tradesBody">
-            <tr><td colspan="7" class="empty-cell">売買履歴はまだありません。</td></tr>
+            <tr><td colspan="8" class="empty-cell">売買履歴はまだありません。</td></tr>
           </tbody>
         </table>
       </div>
@@ -405,6 +420,14 @@
         <label>
           <span>トレーリング反落幅 (%)</span>
           <input name="trailing_stop_pct" type="number" min="0.3" max="10" step="0.2" class="text-input" />
+        </label>
+        <label>
+          <span>取引手数料率 (%, 例: 0.10 / かぶミニ 0.22 / ゼロ革命 0)</span>
+          <input name="fee_rate" type="number" min="0" max="5" step="0.01" class="text-input" />
+        </label>
+        <label>
+          <span>譲渡益税率 (%, 特定口座 20.315 / 簡易 20 / NISA 0)</span>
+          <input name="tax_rate" type="number" min="0" max="50" step="0.005" class="text-input" />
         </label>
         <label>
           <span>スリッページ想定 (bps, 5=0.05%)</span>

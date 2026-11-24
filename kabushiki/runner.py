@@ -122,8 +122,9 @@ def main(argv: list[str] | None = None) -> int:
                 bm = f" / 日経 {item['benchmark_nikkei225_pct']:+.2f}%" if item.get("benchmark_nikkei225_pct") is not None else ""
                 print(
                     f"#{rank} {item['pattern_name']} [{item['interval']} / {item['unit_size']}株] "
-                    f"¥{item['initial_capital']:,.0f} → ¥{item['final_equity']:,.0f} "
+                    f"¥{item['initial_capital']:,.0f} → 税引後¥{item['final_equity']:,.0f} "
                     f"({item['net_pnl']:+,.0f}円 / {item['return_pct']:+.2f}%{bm}) | "
+                    f"手数料¥{item['total_fees']:,.0f} 税¥{item['total_tax']:,.0f} | "
                     f"取引{item['total_trades']}回 勝率{item['win_rate']:.1f}% PF{item['profit_factor']} 最大DD-{item['max_drawdown_pct']:.2f}%"
                 )
             return 0

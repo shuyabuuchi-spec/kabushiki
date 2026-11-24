@@ -149,3 +149,45 @@ def test_parallel_compare_backtest_with_custom_capitals(tmp_path: Path):
     assert caps["p_100k_15m"] == 100000.0
     assert caps["p_500k_15m"] == 500000.0
 
+
+def test_zero_lookahead_preorder_and_20pct_tax_with_fees(tmp_path: Path):
+    """Verify every BUY executes strictly AFTER its pre-order signal_time, and fees + 20% tax are deducted."""
+    from kabushiki.simulator import _apply_realized_tax
+
+    # 1. Verify 特定口座 tax withholding and loss-offset refund math
+    cum, tax_paid, delta1 = _apply_realized_tax(10000.0, 0.0, 0.0, 0.20)
+    assert cum == 10000.0
+    assert tax_paid == 2000.0
+    assert delta1 == 2000.0
+
+    # Loss of -4,000 reduces net profit to 6,000 -> required tax 1,200 -> refund -800
+    cum2, tax_paid2, delta2 = _apply_realized_tax(-4000.0, cum, tax_paid, 0.20)
+    assert cum2 == 6000.0
+    assert tax_paid2 == 1200.0
+    assert delta2 == -800.0
+
+    # 2. Verify zero-lookahead pre-order execution in backtest
+    cfg = _make_test_config()
+    cfg.fee_rate = 0.001
+    cfg.tax_rate = 0.20
+    for p in cfg.patterns:
+        p.fee_rate = 0.001
+        p.tax_rate = 0.20
+    storage = Storage(db_path=tmp_path / "nolookahead.db")
+    sim = TradingSimulator(cfg, storage)
+    data = {
+        "7203.T": _synthetic_wave_bars(2500.0, n_bars=90, phase=0.0),
+        "6758.T": _synthetic_wave_bars(3200.0, n_bars=90, phase=4.0),
+    }
+    res = sim.run_backtest(mode="lot1", interval="15m", days=10, initial_capital=100000.0, preloaded_data=data)
+    assert res["total_trades"] > 0
+    assert res["total_fees"] > 0.0
+    buy_trades = [t for t in res["trades"] if t["side"] == "BUY"]
+    assert len(buy_trades) > 0
+    for tr in buy_trades:
+        # Every single BUY must have a prior pre-order signal_time strictly earlier than execution timestamp!
+        assert tr["signal_time"] != ""
+        assert tr["signal_time"] < tr["timestamp"]
+        assert tr["fee"] > 0.0
+
+

@@ -48,7 +48,8 @@ class SimulationPattern:
     interval: str = "15m"
     max_positions: int = 3
     max_allocation_pct: float = 0.4
-    fee_rate: float = 0.0
+    fee_rate: float = 0.001
+    tax_rate: float = 0.20315
     slippage_bps: float = 5.0
     buy_score_threshold: float = 66.0
     strong_buy_threshold: float = 76.0
@@ -79,6 +80,7 @@ class SimulationPattern:
             max_positions=self.max_positions,
             max_allocation_pct=self.max_allocation_pct,
             fee_rate=self.fee_rate,
+            tax_rate=self.tax_rate,
             slippage_bps=self.slippage_bps,
             buy_score_threshold=self.buy_score_threshold,
             strong_buy_threshold=self.strong_buy_threshold,
@@ -115,7 +117,8 @@ class AppConfig:
     default_mode: str = "lot1"
     max_positions: int = 3
     max_allocation_pct: float = 0.4
-    fee_rate: float = 0.0
+    fee_rate: float = 0.001
+    tax_rate: float = 0.20315
     slippage_bps: float = 5.0
     buy_score_threshold: float = 66.0
     strong_buy_threshold: float = 76.0
