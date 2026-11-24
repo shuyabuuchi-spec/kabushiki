@@ -450,51 +450,115 @@ function renderDashboard() {
   renderTrades("tradesBody", p.trades || []);
 }
 
+function renderMlLearningCurveSVG(containerId, curve) {
+  const box = document.getElementById(containerId);
+  if (!box) return;
+  if (!curve || curve.length < 2) {
+    box.innerHTML = `<div class="empty-state" style="padding:36px 12px;">Walk-Forward 学習経過データはまだ十分に蓄積されていません。</div>`;
+    return;
+  }
+
+  const width = 560;
+  const height = 195;
+  const pad = { top: 22, right: 48, bottom: 28, left: 48 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+
+  const hits = curve.map((c) => Number(c.hit_rate_pct || 0));
+  const ics = curve.map((c) => Number(c.oos_ic || 0));
+  const minHit = Math.min(...hits, 40) - 5;
+  const maxHit = Math.max(...hits, 65) + 5;
+  const hitRange = Math.max(maxHit - minHit, 10);
+
+  const minIc = Math.min(...ics, -0.05) - 0.02;
+  const maxIc = Math.max(...ics, 0.1) + 0.02;
+  const icRange = Math.max(maxIc - minIc, 0.05);
+
+  const xAt = (i) => pad.left + (i / (curve.length - 1)) * plotW;
+  const yHit = (v) => pad.top + plotH - ((v - minHit) / hitRange) * plotH;
+  const yIc = (v) => pad.top + plotH - ((v - minIc) / icRange) * plotH;
+
+  const hitLine = curve.map((c, i) => `${xAt(i).toFixed(1)},${yHit(Number(c.hit_rate_pct || 0)).toFixed(1)}`).join(" ");
+  const icLine = curve.map((c, i) => `${xAt(i).toFixed(1)},${yIc(Number(c.oos_ic || 0)).toFixed(1)}`).join(" ");
+
+  const midIdx = Math.floor(curve.length / 2);
+  const labels = [0, midIdx, curve.length - 1]
+    .map((idx) => {
+      const anchor = idx === 0 ? "start" : idx === curve.length - 1 ? "end" : "middle";
+      return `<text x="${xAt(idx).toFixed(1)}" y="${height - 6}" fill="#8ea0be" font-size="10" text-anchor="${anchor}">F${curve[idx].fold} (${Number(curve[idx].train_samples).toLocaleString("ja-JP")}件)</text>`;
+    })
+    .join("");
+
+  box.innerHTML = `
+    <div class="chart-legend" style="padding:0 4px 4px;">
+      <span class="legend-item"><span class="legend-swatch" style="background:#22c55e"></span>高確信的中率 (%) [左軸]</span>
+      <span class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span>OOS相関係数 IC [右軸]</span>
+    </div>
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="height:175px;">
+      <line x1="${pad.left}" y1="${yHit(50).toFixed(1)}" x2="${width - pad.right}" y2="${yHit(50).toFixed(1)}" stroke="#1e2d4a" stroke-dasharray="4,4" />
+      <text x="${pad.left - 6}" y="${(yHit(maxHit) + 4).toFixed(1)}" fill="#86efac" font-size="10" text-anchor="end">${Math.round(maxHit)}%</text>
+      <text x="${pad.left - 6}" y="${(yHit(minHit) + 4).toFixed(1)}" fill="#86efac" font-size="10" text-anchor="end">${Math.round(minHit)}%</text>
+      <text x="${width - pad.right + 6}" y="${(yIc(maxIc) + 4).toFixed(1)}" fill="#93c5fd" font-size="10" text-anchor="start">${maxIc.toFixed(2)}</text>
+      <text x="${width - pad.right + 6}" y="${(yIc(minIc) + 4).toFixed(1)}" fill="#93c5fd" font-size="10" text-anchor="start">${minIc.toFixed(2)}</text>
+      <polyline points="${hitLine}" fill="none" stroke="#22c55e" stroke-width="2.2" />
+      <polyline points="${icLine}" fill="none" stroke="#3b82f6" stroke-width="2.0" />
+      ${curve.map((c, i) => `<circle cx="${xAt(i).toFixed(1)}" cy="${yHit(Number(c.hit_rate_pct || 0)).toFixed(1)}" r="3" fill="#22c55e" />`).join("")}
+      ${labels}
+    </svg>
+  `;
+}
+
 function renderMlMonitor(ml) {
   const cardsEl = document.getElementById("mlStatusCards");
   const weightsEl = document.getElementById("mlFeatureWeights");
+  const sourcesBody = document.getElementById("mlSourcesBody");
+  const historyBody = document.getElementById("mlHistoryBody");
+  const historyCount = document.getElementById("mlHistoryCount");
   if (!cardsEl) return;
 
-  if (!ml || !ml.total_bars) {
-    cardsEl.innerHTML = `<div class="bt-stat"><div class="bt-stat-label">蓄積学習データ</div><div class="bt-stat-val">未収集</div><div class="stock-meta">スキャンまたは「学習データ収集」で自動蓄積を開始します</div></div>`;
+  if (!ml || (!ml.total_bars && !ml.macro_total_rows)) {
+    cardsEl.innerHTML = `<div class="bt-stat"><div class="bt-stat-label">蓄積学習データ</div><div class="bt-stat-val">未収集</div><div class="stock-meta">スキャンまたは「外部データ収集＆再学習」で自動蓄積を開始します</div></div>`;
     if (weightsEl) weightsEl.innerHTML = "";
+    renderMlLearningCurveSVG("mlLearningCurveChart", []);
     return;
   }
 
   const models = ml.models || {};
-  const primaryModel = models["30m"] || models["15m"] || Object.values(models)[0] || null;
+  const primaryModel = models["30m"] || models["15m"] || models["60m"] || Object.values(models)[0] || null;
   const ivText = (ml.by_interval || [])
     .map((x) => `${x.interval}: ${Number(x.bars).toLocaleString("ja-JP")}本`)
     .join(" / ");
   const spanText = ml.earliest_bar && ml.latest_bar ? `${fmtTime(ml.earliest_bar)} 〜 ${fmtTime(ml.latest_bar)}` : "--";
   const icVal = primaryModel ? Number(primaryModel.oos_ic || 0) : 0;
   const icCls = icVal > 0 ? "up" : icVal < 0 ? "down" : "";
+  const rIc = primaryModel ? Number(primaryModel.ridge_ic || 0) : 0;
+  const gIc = primaryModel ? Number(primaryModel.gbdt_ic || 0) : 0;
 
   cardsEl.innerHTML = `
     <div class="bt-stat">
-      <div class="bt-stat-label">蓄積済み学習バー総数</div>
-      <div class="bt-stat-val">${Number(ml.total_bars).toLocaleString("ja-JP")} 本</div>
-      <div class="stock-meta">${ml.unique_symbols} 銘柄 (${escapeHtml(ivText || "--")})</div>
+      <div class="bt-stat-label">蓄積済み日中足バー総数</div>
+      <div class="bt-stat-val">${Number(ml.total_bars || 0).toLocaleString("ja-JP")} 本</div>
+      <div class="stock-meta">${ml.unique_symbols || 0} 銘柄 (${escapeHtml(ivText || "--")})</div>
     </div>
     <div class="bt-stat">
-      <div class="bt-stat-label">データ蓄積期間 (JST)</div>
-      <div class="bt-stat-val" style="font-size:0.88rem">${escapeHtml(spanText)}</div>
-      <div class="stock-meta">毎回の監視で自動追記・蓄積</div>
+      <div class="bt-stat-label">外部マクロデータ (Yahoo以外)</div>
+      <div class="bt-stat-val">${Number(ml.macro_total_rows || 0).toLocaleString("ja-JP")} 日分</div>
+      <div class="stock-meta">FRED米連銀: ドル円・VIX・米10年債・日経 (${(ml.macro_sources || []).length}系列)</div>
     </div>
     <div class="bt-stat">
       <div class="bt-stat-label">Walk-Forward OOS 相関 (IC)</div>
       <div class="bt-stat-val ${icCls}">${icVal >= 0 ? "+" : ""}${icVal.toFixed(4)}</div>
-      <div class="stock-meta">未来情報ゼロ検証 (${primaryModel ? primaryModel.oos_samples : 0}件)</div>
+      <div class="stock-meta">Ridge ${rIc >= 0 ? "+" : ""}${rIc.toFixed(3)} / GBDT ${gIc >= 0 ? "+" : ""}${gIc.toFixed(3)}</div>
     </div>
     <div class="bt-stat">
-      <div class="bt-stat-label">高確信ML予測 的中率</div>
+      <div class="bt-stat-label">高確信ML予測 的中率 / RMSE</div>
       <div class="bt-stat-val">${primaryModel ? Number(primaryModel.oos_hit_rate_pct || 0).toFixed(1) : "0.0"}%</div>
-      <div class="stock-meta">学習サンプル ${primaryModel ? Number(primaryModel.train_samples || 0).toLocaleString("ja-JP") : 0}件</div>
+      <div class="stock-meta">学習 ${primaryModel ? Number(primaryModel.train_samples || 0).toLocaleString("ja-JP") : 0}件 / 誤差 ${primaryModel ? Number(primaryModel.oos_rmse || 0).toFixed(2) : "0.00"}%</div>
     </div>
     <div class="bt-stat">
-      <div class="bt-stat-label">モデル種別</div>
-      <div class="bt-stat-val" style="font-size:0.88rem">${escapeHtml(primaryModel ? primaryModel.model_type : "Walk-Forward Ridge")}</div>
-      <div class="stock-meta">基準足: ${escapeHtml(primaryModel ? primaryModel.interval : "30m")} / 予測幅 ${primaryModel ? primaryModel.horizon_bars : 8}本</div>
+      <div class="bt-stat-label">稼働モデル (${primaryModel ? primaryModel.feature_count || 22 : 22}特徴量)</div>
+      <div class="bt-stat-val" style="font-size:0.84rem">${escapeHtml(primaryModel ? primaryModel.model_type : "Walk-Forward アンサンブル")}</div>
+      <div class="stock-meta">蓄積期間: ${escapeHtml(spanText)}</div>
     </div>
   `;
 
@@ -509,6 +573,63 @@ function renderMlMonitor(ml) {
         .join("");
   } else if (weightsEl) {
     weightsEl.innerHTML = "";
+  }
+
+  // Render Walk-Forward learning curve SVG
+  renderMlLearningCurveSVG("mlLearningCurveChart", primaryModel ? primaryModel.learning_curve || [] : []);
+
+  // Render data sources breakdown table
+  if (sourcesBody) {
+    const srcRows = [];
+    (ml.by_interval || []).forEach((iv) => {
+      srcRows.push(`
+        <tr>
+          <td><b>Yahoo Finance (${escapeHtml(iv.interval)}足)</b> <span class="stock-meta">${iv.symbols}銘柄</span></td>
+          <td>${Number(iv.bars).toLocaleString("ja-JP")} 本</td>
+          <td class="stock-meta">${escapeHtml(fmtTime(iv.min_ts))} 〜 ${escapeHtml(fmtTime(iv.max_ts))}</td>
+        </tr>
+      `);
+    });
+    (ml.macro_sources || []).forEach((m) => {
+      srcRows.push(`
+        <tr>
+          <td><b>${escapeHtml(m.source)}</b> <span class="stock-meta">${escapeHtml(m.label)}</span></td>
+          <td>${Number(m.days).toLocaleString("ja-JP")} 日分</td>
+          <td class="stock-meta">${escapeHtml(m.min_date)} 〜 ${escapeHtml(m.max_date)}</td>
+        </tr>
+      `);
+    });
+    sourcesBody.innerHTML = srcRows.length
+      ? srcRows.join("")
+      : `<tr><td colspan="3" class="empty-cell">データ未収集</td></tr>`;
+  }
+
+  // Render training history log table
+  const hist = ml.training_history || [];
+  if (historyCount) historyCount.textContent = String(hist.length);
+  if (historyBody) {
+    if (hist.length === 0) {
+      historyBody.innerHTML = `<tr><td colspan="8" class="empty-cell">学習履歴はまだありません。</td></tr>`;
+    } else {
+      historyBody.innerHTML = hist
+        .map((h) => {
+          const ic = Number(h.oos_ic || 0);
+          const icClsRow = ic > 0 ? "up" : ic < 0 ? "down" : "";
+          return `
+            <tr>
+              <td>${escapeHtml(fmtTime(h.timestamp))}</td>
+              <td><span class="badge badge-hold">${escapeHtml(h.interval)}足</span></td>
+              <td class="stock-meta">${escapeHtml(h.model_type)}</td>
+              <td><b>${Number(h.train_samples).toLocaleString("ja-JP")}</b>件</td>
+              <td class="${icClsRow}"><b>${ic >= 0 ? "+" : ""}${ic.toFixed(4)}</b> <span class="stock-meta">(R:${Number(h.ridge_ic || 0).toFixed(3)} / G:${Number(h.gbdt_ic || 0).toFixed(3)})</span></td>
+              <td><b>${Number(h.oos_hit_rate_pct || 0).toFixed(1)}%</b></td>
+              <td>${Number(h.oos_rmse || 0).toFixed(2)}%</td>
+              <td><span class="reason-chip">${escapeHtml(h.top_feature || "--")}</span></td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
   }
 }
 

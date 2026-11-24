@@ -162,7 +162,7 @@ def create_app(
     def collect_ml_data() -> dict[str, Any]:
         cfg = _get_cfg()
         sim = TradingSimulator(cfg, storage, provider=market_provider)
-        res = sim.collect_ml_data(intervals=("15m", "30m"), period_days=55)
+        res = sim.collect_ml_data(intervals=("15m", "30m", "60m"), period_days=55)
         snapshot = storage.export_dashboard_snapshot(cfg)
         return {"ml": res, "dashboard": snapshot}
 

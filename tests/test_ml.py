@@ -55,6 +55,32 @@ def test_ml_bar_persistence_and_walkforward_model(tmp_path: Path):
 
     diag = evaluate_walkforward_oos(panel, interval="30m", horizon_bars=8)
     assert diag.train_samples >= 60
+    assert diag.feature_count == 22
+    assert len(diag.learning_curve) >= 2
+
+    # 3. Verify FRED macro persistence & ml_training_history logging
+    import pandas as pd
+    from kabushiki.external_data import build_daily_macro_frame
+
+    macro_df = pd.DataFrame(
+        [
+            {"date": "2026-11-10", "value": 154.0},
+            {"date": "2026-11-11", "value": 155.0},
+            {"date": "2026-11-12", "value": 156.5},
+            {"date": "2026-11-13", "value": 157.0},
+            {"date": "2026-11-14", "value": 158.0},
+            {"date": "2026-11-17", "value": 158.5},
+        ]
+    )
+    saved_m = storage.save_ml_macro({"FRED_USDJPY": {"source": "FRED", "label": "ドル円", "df": macro_df}})
+    assert saved_m == 6
+    daily_macro = build_daily_macro_frame(storage.load_ml_macro())
+    assert "usdjpy_chg5" in daily_macro.columns
+
+    storage.save_ml_diagnostics("30m", diag.to_dict(), record_history=True)
+    ml_st = storage.get_ml_status()
+    assert ml_st["macro_total_rows"] == 6
+    assert len(ml_st["training_history"]) == 1
 
 
 def test_ml_walkforward_and_mean_reversion_backtest_zero_lookahead(tmp_path: Path):

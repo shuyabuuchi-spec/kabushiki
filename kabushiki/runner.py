@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "collect-ml-data":
-        out = sim.collect_ml_data(intervals=("15m", "30m"), period_days=args.days)
+        out = sim.collect_ml_data(intervals=("15m", "30m", "60m"), period_days=args.days)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 

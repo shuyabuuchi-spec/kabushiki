@@ -17,9 +17,11 @@ from .advisor import (
     _round_jpy,
 )
 from .config import AppConfig, SimulationPattern, MODE_UNIT_SIZE, MODE_LABELS, StockInfo
+from .external_data import fetch_all_external_macro, build_daily_macro_frame
 from .indicators import compute_indicators, extract_latest_snapshot
 from .market_data import JST, MarketDataProvider, now_jst
 from .ml_engine import (
+    WalkForwardEnsembleModel,
     WalkForwardRidgeModel,
     attach_ml_features,
     build_training_panel,
@@ -202,6 +204,45 @@ class TradingSimulator:
         bm_df = _merge_ohlcv_frames(stored_map.get("^N225"), fresh_map.get("^N225"))
         return merged_map, bm_df
 
+    def _ensure_macro_daily_frame(self, force_refresh: bool = False, allow_network: bool = True) -> pd.DataFrame:
+        """Load persisted FRED/ECB macro series from SQLite, refreshing from network when empty or requested."""
+        stored = self.storage.load_ml_macro()
+        is_real_provider = isinstance(self.provider, MarketDataProvider)
+        should_fetch = allow_network and is_real_provider and (force_refresh or not stored)
+        if should_fetch:
+            try:
+                fresh = fetch_all_external_macro(lookback_years=5)
+                if fresh:
+                    self.storage.save_ml_macro(fresh)
+                    stored = self.storage.load_ml_macro()
+            except Exception:
+                pass
+        return build_daily_macro_frame(stored)
+
+    def _load_long_history_60m_panel(
+        self,
+        symbols: list[str],
+        macro_daily_df: pd.DataFrame,
+        horizon_60m: int = 4,
+    ) -> pd.DataFrame:
+        """Build a 2-year 60m prior training panel from SQLite ml_bars (4-hour horizon matching 30m H=8)."""
+        stored_60m = self.storage.load_ml_bars("60m", [*symbols, "^N225"])
+        if not stored_60m:
+            return pd.DataFrame()
+        bm_60m = stored_60m.get("^N225")
+        bm_ind = compute_indicators(bm_60m) if (bm_60m is not None and not bm_60m.empty) else pd.DataFrame()
+        feat_60m: dict[str, pd.DataFrame] = {}
+        for sym in symbols:
+            df = stored_60m.get(sym)
+            if df is not None and len(df) > 60:
+                feat_60m[sym] = attach_ml_features(
+                    compute_indicators(df),
+                    bm_ind,
+                    macro_daily_df=macro_daily_df,
+                    horizon_bars=horizon_60m,
+                )
+        return build_training_panel(feat_60m, warmup_bars=40)
+
     def _prepare_feature_frames(
         self,
         watchlist: list[StockInfo],
@@ -211,7 +252,7 @@ class TradingSimulator:
         preloaded_data: dict[str, pd.DataFrame] | None = None,
         benchmark_df: pd.DataFrame | None = None,
         persist: bool = True,
-    ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
         symbols = [s.symbol for s in watchlist]
         raw_map, fetched_bm = self._fetch_and_accumulate_bars(
             symbols=symbols,
@@ -223,41 +264,80 @@ class TradingSimulator:
         )
         bm_raw = benchmark_df if (benchmark_df is not None and not benchmark_df.empty) else fetched_bm
         bm_ind = compute_indicators(bm_raw) if (bm_raw is not None and not bm_raw.empty) else pd.DataFrame()
+        macro_daily_df = self._ensure_macro_daily_frame(allow_network=(preloaded_data is None and persist))
 
         feat_map: dict[str, pd.DataFrame] = {}
         for sym in symbols:
             df = raw_map.get(sym)
             if df is not None and not df.empty:
                 ind = compute_indicators(df)
-                feat_map[sym] = attach_ml_features(ind, bm_ind, horizon_bars=horizon_bars)
-        return feat_map, bm_raw
+                feat_map[sym] = attach_ml_features(
+                    ind,
+                    bm_ind,
+                    macro_daily_df=macro_daily_df,
+                    horizon_bars=horizon_bars,
+                )
+        return feat_map, bm_raw, macro_daily_df
 
     def collect_ml_data(
         self,
-        intervals: tuple[str, ...] = ("15m", "30m"),
+        intervals: tuple[str, ...] = ("15m", "30m", "60m"),
         period_days: int = 55,
     ) -> dict[str, Any]:
-        """Collect & persist real Yahoo Finance bars for all watchlist stocks + ^N225 and refresh OOS ML metrics."""
+        """Collect & persist multi-source data (Yahoo 15m/30m + Yahoo 60m 2-year + FRED/ECB 5-year macro) & train."""
         all_syms = sorted(set(self.cfg.symbol_meta_map().keys()))
-        collected: dict[str, Any] = {}
-        for iv in intervals:
-            raw_map, bm_raw = self._fetch_and_accumulate_bars(
+        # 1. External non-Yahoo macro data (FRED: USD/JPY, VIX, US10Y, Nikkei + ECB Frankfurter fallback)
+        macro_daily_df = self._ensure_macro_daily_frame(force_refresh=True, allow_network=True)
+
+        # 2. Fetch 60m long history (up to ~2 years = 700 days, capped at 1,500 bars/symbol in DB)
+        if "60m" in intervals:
+            raw_60m, bm_60m = self._fetch_and_accumulate_bars(
                 symbols=all_syms,
-                interval=iv,
-                period_days=period_days,
+                interval="60m",
+                period_days=650,
                 include_benchmark=True,
                 persist=True,
             )
+            if raw_60m:
+                self.storage.save_ml_bars("60m", {**raw_60m, **({"^N225": bm_60m} if not bm_60m.empty else {})}, max_bars_per_symbol=1500)
+
+        prior_60m_panel = self._load_long_history_60m_panel(all_syms, macro_daily_df, horizon_60m=4)
+        sources_desc = "Yahoo 15m/30m + Yahoo 60m(長期) + FRED米連銀(ドル円/VIX/米10年債)"
+
+        collected: dict[str, Any] = {}
+        for iv in intervals:
+            if iv == "60m":
+                raw_map = self.storage.load_ml_bars("60m", all_syms)
+                bm_raw = self.storage.load_ml_bars("60m", ["^N225"]).get("^N225", pd.DataFrame())
+            else:
+                raw_map, bm_raw = self._fetch_and_accumulate_bars(
+                    symbols=all_syms,
+                    interval=iv,
+                    period_days=period_days,
+                    include_benchmark=True,
+                    persist=True,
+                )
             bm_ind = compute_indicators(bm_raw) if (bm_raw is not None and not bm_raw.empty) else pd.DataFrame()
-            horizon = 12 if iv == "15m" else 8
+            horizon = 12 if iv == "15m" else (4 if iv == "60m" else 8)
             feat_map = {
-                sym: attach_ml_features(compute_indicators(df), bm_ind, horizon_bars=horizon)
+                sym: attach_ml_features(
+                    compute_indicators(df),
+                    bm_ind,
+                    macro_daily_df=macro_daily_df,
+                    horizon_bars=horizon,
+                )
                 for sym, df in raw_map.items()
                 if not df.empty
             }
-            panel = build_training_panel(feat_map)
-            diag = evaluate_walkforward_oos(panel, interval=iv, horizon_bars=horizon)
-            self.storage.save_ml_diagnostics(iv, diag.to_dict())
+            use_prior = prior_60m_panel if (iv == "30m" and not prior_60m_panel.empty) else None
+            panel = build_training_panel(feat_map, extra_prior_panel=use_prior)
+            diag = evaluate_walkforward_oos(
+                panel,
+                interval=iv,
+                horizon_bars=horizon,
+                data_sources=sources_desc,
+            )
+            self.storage.save_ml_diagnostics(iv, diag.to_dict(), record_history=True)
             collected[iv] = {
                 "symbols": len(raw_map),
                 "diagnostics": diag.to_dict(),
@@ -785,7 +865,7 @@ class TradingSimulator:
         iv_bars = next((x["bars"] for x in stored_stats["by_interval"] if x["interval"] == use_interval), 0)
         fetch_days = 55 if (pattern.strategy_type == "ml_walkforward" and iv_bars < 1500 and preloaded_data is None) else max(lookback_days, 7)
 
-        feat_map, _ = self._prepare_feature_frames(
+        feat_map, _, macro_daily_df = self._prepare_feature_frames(
             watchlist=watchlist,
             interval=use_interval,
             period_days=fetch_days,
@@ -824,18 +904,25 @@ class TradingSimulator:
             if not target_ts:
                 target_ts = [sorted_ts[-1]]
 
-        ml_model: WalkForwardRidgeModel | None = None
+        ml_model: WalkForwardEnsembleModel | None = None
         panel_df: pd.DataFrame | None = None
         if pattern.strategy_type == "ml_walkforward":
-            panel_df = build_training_panel(feat_map)
-            ml_model = WalkForwardRidgeModel(horizon_bars=pattern.ml_horizon_bars)
+            prior_60m = (
+                self._load_long_history_60m_panel([s.symbol for s in watchlist], macro_daily_df, horizon_60m=4)
+                if use_interval == "30m"
+                else None
+            )
+            panel_df = build_training_panel(feat_map, extra_prior_panel=prior_60m)
+            ml_model = WalkForwardEnsembleModel(horizon_bars=pattern.ml_horizon_bars)
+            sources_desc = "Yahoo日中足 + Yahoo 60m(長期) + FRED米連銀(ドル円/VIX/米10年債)" if (prior_60m is not None and not prior_60m.empty) else "Yahoo日中足 + FRED米連銀(ドル円/VIX/米10年債)"
             diag = evaluate_walkforward_oos(
                 panel_df,
                 interval=use_interval,
                 horizon_bars=pattern.ml_horizon_bars,
                 min_pred_return=pattern.ml_min_pred_return,
+                data_sources=sources_desc,
             )
-            self.storage.save_ml_diagnostics(use_interval, diag.to_dict())
+            self.storage.save_ml_diagnostics(use_interval, diag.to_dict(), record_history=True)
 
         total_trades = 0
         last_res: dict[str, Any] = {}
@@ -903,6 +990,24 @@ class TradingSimulator:
 
         stored_stats = self.storage.get_ml_status()
         stored_counts = {x["interval"]: x["bars"] for x in stored_stats["by_interval"]}
+
+        # Auto-bootstrap external FRED macro data (5y) and 60m long history (~1-2y) if not yet persisted
+        if any(interval_needs_ml.values()) and isinstance(self.provider, MarketDataProvider):
+            self._ensure_macro_daily_frame(force_refresh=(stored_stats.get("macro_total_rows", 0) == 0), allow_network=True)
+            if stored_counts.get("60m", 0) < 1000:
+                all_ml_syms = sorted({s for syms in interval_symbols.values() for s in syms})
+                raw_60m, bm_60m = self._fetch_and_accumulate_bars(
+                    symbols=all_ml_syms,
+                    interval="60m",
+                    period_days=650,
+                    include_benchmark=True,
+                    persist=False,
+                )
+                if raw_60m:
+                    to_save = {**raw_60m}
+                    if bm_60m is not None and not bm_60m.empty:
+                        to_save["^N225"] = bm_60m
+                    self.storage.save_ml_bars("60m", to_save, max_bars_per_symbol=1500)
 
         merged_by_interval: dict[str, dict[str, pd.DataFrame]] = {}
         bm_by_interval: dict[str, pd.DataFrame] = {}
@@ -974,7 +1079,7 @@ class TradingSimulator:
         )
         last_bar_ts_str = portfolio.get("last_bar_ts")
 
-        feat_map, _ = self._prepare_feature_frames(
+        feat_map, _, _ = self._prepare_feature_frames(
             watchlist=watchlist,
             interval=use_interval,
             period_days=14,
@@ -1079,7 +1184,7 @@ class TradingSimulator:
         # ML needs extra historical warmup bars before day 1 for strictly causal walk-forward training
         extra_warmup_days = 25 if pattern.strategy_type == "ml_walkforward" else 5
         fetch_days = min(58, max(days + extra_warmup_days, 12))
-        feat_map, bm_raw = self._prepare_feature_frames(
+        feat_map, bm_raw, macro_daily_df = self._prepare_feature_frames(
             watchlist=watchlist,
             interval=use_interval,
             period_days=fetch_days,
@@ -1107,11 +1212,16 @@ class TradingSimulator:
         if not sim_timestamps:
             sim_timestamps = sorted_ts[warmup_start:]
 
-        ml_model: WalkForwardRidgeModel | None = None
+        ml_model: WalkForwardEnsembleModel | None = None
         panel_df: pd.DataFrame | None = None
         if pattern.strategy_type == "ml_walkforward":
-            panel_df = build_training_panel(feat_map)
-            ml_model = WalkForwardRidgeModel(horizon_bars=pattern.ml_horizon_bars)
+            prior_60m = (
+                self._load_long_history_60m_panel([s.symbol for s in watchlist], macro_daily_df, horizon_60m=4)
+                if (use_interval == "30m" and preloaded_data is None)
+                else None
+            )
+            panel_df = build_training_panel(feat_map, extra_prior_panel=prior_60m)
+            ml_model = WalkForwardEnsembleModel(horizon_bars=pattern.ml_horizon_bars)
 
         cash = init_cap
         realized_pnl_total = 0.0

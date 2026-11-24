@@ -51,19 +51,68 @@
   <main class="container">
     <div id="toastArea" class="toast hidden"></div>
 
-    <!-- ML Training Data Accumulation & Model Accuracy Monitor -->
+    <!-- ML Training Data Accumulation & Learning Progress Monitor -->
     <section class="card" id="mlMonitorSection">
       <div class="card-header">
         <div>
-          <h2>🤖 機械学習データ蓄積＆Walk-Forward予測モデル精度</h2>
-          <p class="card-desc">毎回の日中足データ（東証銘柄＋日経平均 ^N225）を暗号化DBへ継続蓄積し、未来情報ゼロのWalk-Forward再学習で精度を自動向上します。</p>
+          <h2>🤖 機械学習モデル・外部データ蓄積＆学習経過モニター</h2>
+          <p class="card-desc"><b>Walk-Forward アンサンブル（L2 Ridge回帰 55% ＋ 勾配ブースティング HistGBDT 45%）</b>。Yahoo日中足（15m/30m/60m長期）＋<b>FRED米連銀公式マクロ（ドル円・VIX恐怖指数・米10年債・日経225）</b>の22特徴量で継続学習します。</p>
         </div>
-        <button id="btnCollectMl" class="btn btn-ghost btn-sm">📥 学習データ収集＆再学習</button>
+        <button id="btnCollectMl" class="btn btn-ghost btn-sm">📥 外部データ収集＆再学習</button>
       </div>
       <div class="bt-summary-grid" id="mlStatusCards">
         <div class="bt-stat"><div class="bt-stat-label">蓄積バー総数</div><div class="bt-stat-val">--</div></div>
       </div>
       <div id="mlFeatureWeights" class="reason-list" style="margin-top:8px;"></div>
+
+      <div class="grid-two" style="margin-top:14px;">
+        <div>
+          <div class="stock-meta" style="margin-bottom:6px;font-weight:600;color:#cbd5e1;">📈 Walk-Forward 学習経過（データ量増加に対する的中率・OOS相関係数IC推移）</div>
+          <div class="chart-box" id="mlLearningCurveChart" style="min-height:200px;">
+            <div class="empty-state">学習経過データを取得中...</div>
+          </div>
+        </div>
+        <div>
+          <div class="stock-meta" style="margin-bottom:6px;font-weight:600;color:#cbd5e1;">🌐 取得済みデータソース一覧（Yahoo以外含む）</div>
+          <div class="table-wrap" style="max-height:220px;overflow-y:auto;">
+            <table class="data-table compact">
+              <thead>
+                <tr>
+                  <th>ソース / データ種別</th>
+                  <th>件数</th>
+                  <th>期間</th>
+                </tr>
+              </thead>
+              <tbody id="mlSourcesBody">
+                <tr><td colspan="3" class="empty-cell">データ未収集</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <details class="bt-trades-details" style="margin-top:12px;">
+        <summary>📜 機械学習の学習履歴ログを表示 (<span id="mlHistoryCount">0</span>件)</summary>
+        <div class="table-wrap">
+          <table class="data-table compact">
+            <thead>
+              <tr>
+                <th>学習日時 (JST)</th>
+                <th>対象足</th>
+                <th>モデル</th>
+                <th>学習件数</th>
+                <th>Ensemble IC (Ridge / GBDT)</th>
+                <th>的中率</th>
+                <th>誤差RMSE</th>
+                <th>最重視特徴量</th>
+              </tr>
+            </thead>
+            <tbody id="mlHistoryBody">
+              <tr><td colspan="8" class="empty-cell">学習履歴はまだありません。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <!-- Parallel Pattern Comparison Board -->

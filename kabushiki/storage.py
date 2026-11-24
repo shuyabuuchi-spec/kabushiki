@@ -123,6 +123,35 @@ CREATE TABLE IF NOT EXISTS ml_model_status (
     diagnostics_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ml_macro (
+    series_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    label TEXT NOT NULL,
+    date TEXT NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (series_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ml_macro_series_date ON ml_macro (series_id, date ASC);
+
+CREATE TABLE IF NOT EXISTS ml_training_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    model_type TEXT NOT NULL,
+    data_sources TEXT NOT NULL,
+    train_samples INTEGER NOT NULL,
+    oos_samples INTEGER NOT NULL,
+    oos_ic REAL NOT NULL,
+    ridge_ic REAL NOT NULL DEFAULT 0.0,
+    gbdt_ic REAL NOT NULL DEFAULT 0.0,
+    oos_hit_rate_pct REAL NOT NULL,
+    oos_rmse REAL NOT NULL DEFAULT 0.0,
+    top_feature TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_ml_history_ts ON ml_training_history (timestamp DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS symbol_cooldowns (
     mode TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -598,7 +627,90 @@ class Storage:
             result[sym] = df[~df.index.duplicated(keep="last")].sort_index()
         return result
 
-    def save_ml_diagnostics(self, interval: str, diagnostics: dict[str, Any]) -> None:
+    def save_ml_macro(self, macro_collected: dict[str, dict[str, Any]]) -> int:
+        """Persist external macro series (FRED / Frankfurter) into SQLite."""
+        if not macro_collected:
+            return 0
+        total = 0
+        with self._connect() as conn:
+            for series_id, meta in macro_collected.items():
+                df = meta.get("df")
+                if df is None or df.empty:
+                    continue
+                src = str(meta.get("source", "External"))
+                lbl = str(meta.get("label", series_id))
+                recs = [
+                    (series_id, src, lbl, str(r["date"]), float(r["value"]))
+                    for _, r in df.iterrows()
+                ]
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO ml_macro (series_id, source, label, date, value)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    recs,
+                )
+                total += len(recs)
+        return total
+
+    def load_ml_macro(self) -> dict[str, pd.DataFrame]:
+        """Load persisted external macro series as {series_id: DataFrame[date, value]}."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT series_id, date, value FROM ml_macro ORDER BY series_id ASC, date ASC"
+            ).fetchall()
+        by_sid: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_sid.setdefault(str(r["series_id"]), []).append({"date": str(r["date"]), "value": float(r["value"])})
+        return {sid: pd.DataFrame(items) for sid, items in by_sid.items()}
+
+    def record_ml_training_run(self, diag: dict[str, Any]) -> None:
+        """Append a training evaluation snapshot to ml_training_history for progress tracking."""
+        now = now_jst().isoformat()
+        top_feats = diag.get("top_features") or []
+        top_feat = top_feats[0]["label"] if top_feats else ""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ml_training_history (
+                    timestamp, interval, model_type, data_sources,
+                    train_samples, oos_samples, oos_ic, ridge_ic, gbdt_ic,
+                    oos_hit_rate_pct, oos_rmse, top_feature
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    str(diag.get("interval", "30m")),
+                    str(diag.get("model_type", "Ensemble")),
+                    str(diag.get("data_sources", "")),
+                    int(diag.get("train_samples", 0)),
+                    int(diag.get("oos_samples", 0)),
+                    float(diag.get("oos_ic", 0.0)),
+                    float(diag.get("ridge_ic", 0.0)),
+                    float(diag.get("gbdt_ic", 0.0)),
+                    float(diag.get("oos_hit_rate_pct", 0.0)),
+                    float(diag.get("oos_rmse", 0.0)),
+                    top_feat,
+                ),
+            )
+            # Keep most recent 200 training history rows
+            conn.execute(
+                """
+                DELETE FROM ml_training_history
+                WHERE id NOT IN (SELECT id FROM ml_training_history ORDER BY id DESC LIMIT 200)
+                """
+            )
+
+    def get_ml_training_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ml_training_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_ml_diagnostics(self, interval: str, diagnostics: dict[str, Any], record_history: bool = True) -> None:
         now = now_jst().isoformat()
         with self._connect() as conn:
             conn.execute(
@@ -611,9 +723,11 @@ class Storage:
                 """,
                 (interval, now, json.dumps(diagnostics, ensure_ascii=False)),
             )
+        if record_history and int(diagnostics.get("train_samples", 0)) > 0:
+            self.record_ml_training_run(diagnostics)
 
     def get_ml_status(self) -> dict[str, Any]:
-        """Return accumulated ML dataset statistics and latest Walk-Forward OOS diagnostics."""
+        """Return accumulated ML dataset statistics, external macro sources, models, and training progress history."""
         with self._connect() as conn:
             total_row = conn.execute(
                 "SELECT COUNT(*) AS cnt, COUNT(DISTINCT symbol) AS syms, MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts FROM ml_bars"
@@ -627,6 +741,14 @@ class Storage:
                 ORDER BY interval ASC
                 """
             ).fetchall()
+            macro_rows = conn.execute(
+                """
+                SELECT series_id, source, label, COUNT(*) AS days, MIN(date) AS min_date, MAX(date) AS max_date
+                FROM ml_macro
+                GROUP BY series_id, source, label
+                ORDER BY series_id ASC
+                """
+            ).fetchall()
             diag_rows = conn.execute("SELECT interval, updated_at, diagnostics_json FROM ml_model_status").fetchall()
 
         models: dict[str, Any] = {}
@@ -635,13 +757,19 @@ class Storage:
             d["updated_at"] = r["updated_at"]
             models[str(r["interval"])] = d
 
+        macro_sources = [dict(r) for r in macro_rows]
+        macro_total_rows = sum(int(m["days"]) for m in macro_sources)
+
         return {
             "total_bars": int(total_row["cnt"] or 0),
             "unique_symbols": int(total_row["syms"] or 0),
             "earliest_bar": total_row["min_ts"],
             "latest_bar": total_row["max_ts"],
             "by_interval": [dict(r) for r in iv_rows],
+            "macro_total_rows": macro_total_rows,
+            "macro_sources": macro_sources,
             "models": models,
+            "training_history": self.get_ml_training_history(limit=40),
         }
 
     def build_pattern_summary(self, pattern: SimulationPattern) -> dict[str, Any]:
