@@ -12,6 +12,16 @@ on:
         required: false
         default: "true"
         type: boolean
+      reset_pattern:
+        description: "初期資金でリセットするパターンID（空欄=リセットなし / all=全リセット）"
+        required: false
+        default: ""
+        type: string
+      collect_ml:
+        description: "外部マクロ＋長期60mデータを再収集してMLモデルを再学習する"
+        required: false
+        default: "false"
+        type: boolean
 
 permissions:
   contents: write
@@ -47,6 +57,18 @@ jobs:
         run: |
           if [ -n "$DASHBOARD_PASSPHRASE" ]; then
             python -m kabushiki.runner decrypt-state
+          fi
+
+      - name: Optional pattern reset or ML data collection
+        env:
+          RESET_PATTERN: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_pattern || '' }}
+          COLLECT_ML: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_ml || 'false' }}
+        run: |
+          if [ -n "$RESET_PATTERN" ]; then
+            python -m kabushiki.runner reset --pattern "$RESET_PATTERN"
+          fi
+          if [ "$COLLECT_ML" = "true" ]; then
+            python -m kabushiki.runner collect-ml-data --days 55
           fi
 
       - name: Run parallel catch-up monitor & simulation for all enabled patterns

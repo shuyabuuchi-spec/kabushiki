@@ -66,7 +66,10 @@ python -m venv .venv
    - `Settings → Secrets and variables → Actions → Repository secrets → New repository secret`
    - **Name**: `DASHBOARD_PASSPHRASE` / **Secret**: 任意のパスワード → **Add secret**
    - `Actions` タブから `Monitor JP Stocks & Multi-Pattern Simulator (PC OFF)` を1回実行すると、DBとJSONが自動暗号化され、GitHub Pages にログイン画面が表示されます（コード・リポジトリ内にパスワード平文は一切保存されません）。
-5. パターンを追加・変更した `data/user_config.json` をリポジトリにコミットしておけば、PC OFF 中の GitHub Actions でもその設定のまま並行稼働します。
+5. **GitHub Pages 上から直接パターン追加・編集・削除する場合**:
+   - GitHub の [Fine-grained personal access tokens](https://github.com/settings/personal-access-tokens/new) で対象リポジトリを `kabushiki` のみに限定し、**Contents: Read and write** と **Actions: Read and write** を付与してトークンを発行します。
+   - ダッシュボード右上の **「☁ GitHub編集連携」** からトークンを登録すると（トークンはブラウザ内のみ保持・Gitには一切保存されません）、スマホや外出先からでも直接パターンの追加・編集・削除・即時シミュレーション実行が可能になります。
+6. パターンを追加・変更した `data/user_config.json` をリポジトリにコミットしておけば、PC OFF 中の GitHub Actions でもその設定のまま並行稼働します。
 
 ---
 

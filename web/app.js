@@ -4,6 +4,8 @@ const SERIES_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#ec4899", "#a855f7", "#
 
 const state = {
   apiAvailable: false,
+  githubConnected: false,
+  githubConfig: { owner: "", repo: "", token: "", branch: "main" },
   encryptedMode: false,
   encryptedEnvelope: null,
   selectedPatternId: null,
@@ -12,6 +14,170 @@ const state = {
 };
 
 const SESSION_KEY = "kabushiki_unlock_pass";
+const GH_SESSION_KEY = "kabushiki_gh_edit_session";
+const GH_LOCAL_KEY = "kabushiki_gh_edit_local";
+
+function canEditPatterns() {
+  return state.apiAvailable || state.githubConnected;
+}
+
+function detectDefaultGithubRepo() {
+  const host = window.location.hostname || "";
+  const pathParts = (window.location.pathname || "").split("/").filter(Boolean);
+  let owner = "shuyabuuchi-spec";
+  let repo = "kabushiki";
+  if (host.endsWith(".github.io")) {
+    owner = host.replace(/\.github\.io$/, "");
+    if (pathParts.length > 0) repo = pathParts[0];
+  }
+  return { owner, repo };
+}
+
+function utf8ToBase64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function base64ToUtf8(b64) {
+  const clean = String(b64 || "").replace(/\s+/g, "");
+  return new TextDecoder().decode(b64ToBytes(clean));
+}
+
+function slugifyPatternIdJS(raw, existingIds) {
+  let cleaned = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!cleaned) cleaned = "pattern";
+  if (!cleaned.startsWith("p_")) cleaned = `p_${cleaned}`;
+  cleaned = cleaned.slice(0, 40);
+  const used = new Set(existingIds || []);
+  if (!used.has(cleaned)) return cleaned;
+  let idx = 2;
+  while (used.has(`${cleaned}_${idx}`)) idx++;
+  return `${cleaned}_${idx}`;
+}
+
+function loadSavedGithubConfig() {
+  try {
+    const raw = sessionStorage.getItem(GH_SESSION_KEY) || localStorage.getItem(GH_LOCAL_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.owner && parsed.repo && parsed.token) {
+      state.githubConfig = { owner: parsed.owner, repo: parsed.repo, token: parsed.token, branch: "main" };
+      state.githubConnected = true;
+      return true;
+    }
+  } catch {
+    // ignore corrupted storage
+  }
+  return false;
+}
+
+async function ghApiFetch(path, options = {}) {
+  const { owner, repo, token } = state.githubConfig;
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${path}`;
+  const resp = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  return resp;
+}
+
+async function ghLoadRepoConfig() {
+  // Try data/user_config.json first, fallback to config/default_config.json
+  let sha = null;
+  let cfgObj = null;
+  const rUser = await ghApiFetch(`/contents/data/user_config.json?ref=${state.githubConfig.branch}`);
+  if (rUser.ok) {
+    const j = await rUser.json();
+    sha = j.sha;
+    cfgObj = JSON.parse(base64ToUtf8(j.content));
+  }
+  const rDef = await ghApiFetch(`/contents/config/default_config.json?ref=${state.githubConfig.branch}`);
+  if (!rDef.ok && !cfgObj) {
+    throw new Error(`リポジトリ設定の取得に失敗しました (HTTP ${rDef.status})`);
+  }
+  const defObj = rDef.ok ? JSON.parse(base64ToUtf8((await rDef.json()).content)) : {};
+  const merged = { ...defObj, ...(cfgObj || {}) };
+  if (!merged.patterns || !Array.isArray(merged.patterns)) merged.patterns = defObj.patterns || [];
+  if (!merged.watchlists) merged.watchlists = defObj.watchlists || {};
+  return { cfg: merged, sha };
+}
+
+async function ghSaveRepoConfig(cfgObj, sha, commitMessage) {
+  const body = {
+    message: commitMessage,
+    content: utf8ToBase64(JSON.stringify(cfgObj, null, 2) + "\n"),
+    branch: state.githubConfig.branch,
+  };
+  if (sha) body.sha = sha;
+  const resp = await ghApiFetch("/contents/data/user_config.json", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.message || `GitHub保存失敗 (HTTP ${resp.status})`);
+  }
+  return await resp.json();
+}
+
+async function ghDispatchMonitorWorkflow(inputs = {}) {
+  const resp = await ghApiFetch("/actions/workflows/monitor_and_simulate.yml/dispatches", {
+    method: "POST",
+    body: JSON.stringify({
+      ref: state.githubConfig.branch,
+      inputs: {
+        force_run: "true",
+        reset_pattern: inputs.reset_pattern || "",
+        collect_ml: inputs.collect_ml ? "true" : "false",
+      },
+    }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.message || `Actions起動失敗 (HTTP ${resp.status})。トークンに Actions: Read and write 権限があるか確認してください。`);
+  }
+  return true;
+}
+
+function syncActionButtonsForMode() {
+  const editable = canEditPatterns();
+  const isStatic = !state.apiAvailable;
+  const ghBtn = document.getElementById("btnGithubConnect");
+  if (ghBtn) {
+    ghBtn.classList.toggle("hidden", !isStatic);
+    ghBtn.textContent = state.githubConnected ? "☁ GitHub連携中" : "☁ GitHub編集連携";
+  }
+
+  ["btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnCatchup", "btnCollectMl"].forEach(
+    (id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = !editable;
+    }
+  );
+  // Real-time interactive backtest requires local Python server
+  const btBtn = document.getElementById("btnRunBacktest");
+  if (btBtn) btBtn.disabled = !state.apiAvailable;
+
+  if (isStatic && state.githubConnected) {
+    const connBadge = document.getElementById("connectionBadge");
+    connBadge.textContent = state.encryptedMode
+      ? "🔒 暗号化＋☁GitHub編集連携中"
+      : "☁ GitHub編集連携中";
+    connBadge.className = "pill pill-ok";
+  }
+}
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -54,12 +220,8 @@ async function decryptDashboardEnvelope(envelope, passphrase) {
 }
 
 function setStaticButtonsDisabled() {
-  ["btnCatchup", "btnAddPattern", "btnAddPatternTop", "btnEditSelected", "btnResetSelected", "btnRunBacktest", "btnCollectMl"].forEach(
-    (id) => {
-      const el = document.getElementById(id);
-      if (el) el.disabled = true;
-    }
-  );
+  loadSavedGithubConfig();
+  syncActionButtonsForMode();
 }
 
 async function tryUnlockWithPassphrase(passphrase) {
@@ -338,7 +500,7 @@ function renderPatternsTable() {
       const pnlCls = p.net_pnl > 0 ? "up" : p.net_pnl < 0 ? "down" : "";
       const pat = p.pattern || {};
       const ruleHint = `買≥${pat.buy_score_threshold ?? 66} / 利確+${((pat.take_profit_pct ?? 0.035) * 100).toFixed(1)}% / 損切-${((pat.stop_loss_pct ?? 0.02) * 100).toFixed(1)}%${pat.close_before_eod ? " / 引け決済" : ""}`;
-      const disableAttr = state.apiAvailable ? "" : "disabled";
+      const disableAttr = canEditPatterns() ? "" : "disabled";
 
       return `
         <tr class="pattern-row ${isSelected ? "active-row" : ""} ${isEnabled ? "" : "disabled-row"}" data-pid="${escapeHtml(pid)}">
@@ -873,9 +1035,23 @@ async function loadDashboard() {
 }
 
 async function handleCatchupScan() {
-  if (!state.apiAvailable) return;
+  if (!canEditPatterns()) return;
   const btn = document.getElementById("btnCatchup");
   btn.disabled = true;
+  if (!state.apiAvailable && state.githubConnected) {
+    btn.textContent = "⏳ GitHub Actions 起動中...";
+    try {
+      await ghDispatchMonitorWorkflow({ force_run: true });
+      showToast("GitHub Actions の全パターン最新スキャンを起動しました！約1〜2分後に画面を再読み込みすると反映されます。");
+    } catch (err) {
+      showToast(`GitHub Actions起動エラー: ${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⚡ 全パターン最新スキャン＆補完";
+    }
+    return;
+  }
+
   btn.textContent = "⏳ 全パターン取得・補完中...";
   try {
     const resp = await fetch("/api/scan", {
@@ -1029,7 +1205,7 @@ function renderSingleBacktest(res) {
 }
 
 function openPatternModal(patternId = null, duplicate = false) {
-  if (!state.apiAvailable) return;
+  if (!canEditPatterns()) return;
   const form = document.getElementById("patternForm");
   const titleEl = document.getElementById("patternModalTitle");
   const resetWrap = document.getElementById("resetOnSaveWrap");
@@ -1113,6 +1289,83 @@ async function savePatternForm(e) {
     payload.reset_portfolio = form.reset_portfolio.checked;
   }
 
+  // GitHub Pages direct-edit path (via GitHub Contents + Actions API)
+  if (!state.apiAvailable && state.githubConnected) {
+    try {
+      const { cfg, sha } = await ghLoadRepoConfig();
+      let savedPattern = null;
+      if (pid) {
+        const idx = cfg.patterns.findIndex((p) => p.id === pid);
+        if (idx < 0) throw new Error("対象パターンが設定ファイルに見つかりません");
+        const { reset_portfolio, ...cleanUpdates } = payload;
+        cfg.patterns[idx] = { ...cfg.patterns[idx], ...cleanUpdates, id: pid };
+        savedPattern = cfg.patterns[idx];
+      } else {
+        const newId = slugifyPatternIdJS(payload.name, cfg.patterns.map((p) => p.id));
+        savedPattern = { id: newId, ...payload };
+        cfg.patterns.push(savedPattern);
+      }
+
+      await ghSaveRepoConfig(
+        cfg,
+        sha,
+        pid ? `chore(config): update pattern ${savedPattern.id}` : `chore(config): add pattern ${savedPattern.id}`
+      );
+      await ghDispatchMonitorWorkflow({
+        force_run: true,
+        reset_pattern: pid && payload.reset_portfolio ? pid : "",
+      });
+
+      // Optimistically reflect in UI immediately
+      if (state.dashboard && state.dashboard.patterns) {
+        const prev = state.dashboard.patterns[savedPattern.id];
+        state.dashboard.patterns[savedPattern.id] = {
+          ...(prev || {
+            total_equity: savedPattern.initial_capital,
+            cash: savedPattern.initial_capital,
+            holdings_value: 0,
+            net_pnl: 0,
+            return_pct: 0,
+            realized_pnl: 0,
+            unrealized_pnl: 0,
+            total_fees: 0,
+            total_tax: 0,
+            trade_count: 0,
+            closed_trades: 0,
+            win_rate: 0,
+            profit_factor: 0,
+            max_drawdown_pct: 0,
+            positions: [],
+            pending_orders: [],
+            sell_evaluations: [],
+            recommendations: [],
+            trades: [],
+            equity_history: [],
+          }),
+          pattern_id: savedPattern.id,
+          mode: savedPattern.id,
+          mode_label: savedPattern.name,
+          initial_capital: savedPattern.initial_capital,
+          unit_size: savedPattern.unit_size,
+          interval: savedPattern.interval,
+          enabled: savedPattern.enabled,
+          pattern: savedPattern,
+        };
+        if (!state.dashboard.pattern_order.includes(savedPattern.id)) {
+          state.dashboard.pattern_order.push(savedPattern.id);
+        }
+        state.selectedPatternId = savedPattern.id;
+      }
+
+      document.getElementById("patternModal").classList.add("hidden");
+      renderDashboard();
+      showToast(`GitHubへ「${savedPattern.name}」を保存し、自動シミュレーションを起動しました（約1〜2分後に最新結果が反映されます）。`);
+    } catch (err) {
+      showToast(`GitHub保存エラー: ${err.message}`, true);
+    }
+    return;
+  }
+
   try {
     const url = pid ? `/api/patterns/${encodeURIComponent(pid)}` : "/api/patterns";
     const method = pid ? "PUT" : "POST";
@@ -1137,6 +1390,25 @@ async function togglePatternEnabled(pid) {
   const list = getPatternList();
   const target = list.find((p) => (p.pattern_id || p.mode) === pid);
   if (!target) return;
+  if (!state.apiAvailable && state.githubConnected) {
+    try {
+      const { cfg, sha } = await ghLoadRepoConfig();
+      const item = cfg.patterns.find((p) => p.id === pid);
+      if (!item) throw new Error("対象パターンが見つかりません");
+      item.enabled = !target.enabled;
+      await ghSaveRepoConfig(cfg, sha, `chore(config): toggle pattern ${pid}`);
+      await ghDispatchMonitorWorkflow({ force_run: true });
+      if (state.dashboard && state.dashboard.patterns && state.dashboard.patterns[pid]) {
+        state.dashboard.patterns[pid].enabled = item.enabled;
+        if (state.dashboard.patterns[pid].pattern) state.dashboard.patterns[pid].pattern.enabled = item.enabled;
+      }
+      renderDashboard();
+      showToast(`GitHub設定を更新：「${target.mode_label}」を${item.enabled ? "稼働中" : "停止"}に変更しました。`);
+    } catch (err) {
+      showToast(`GitHub更新エラー: ${err.message}`, true);
+    }
+    return;
+  }
   try {
     const resp = await fetch(`/api/patterns/${encodeURIComponent(pid)}`, {
       method: "PUT",
@@ -1158,6 +1430,25 @@ async function deletePattern(pid) {
   const target = list.find((p) => (p.pattern_id || p.mode) === pid);
   if (!target) return;
   if (!confirm(`パターン「${target.mode_label}」とそのシミュレーション履歴を削除しますか？`)) return;
+  if (!state.apiAvailable && state.githubConnected) {
+    try {
+      const { cfg, sha } = await ghLoadRepoConfig();
+      if (cfg.patterns.length <= 1) throw new Error("最低1つのパターンを残す必要があります");
+      cfg.patterns = cfg.patterns.filter((p) => p.id !== pid);
+      await ghSaveRepoConfig(cfg, sha, `chore(config): delete pattern ${pid}`);
+      await ghDispatchMonitorWorkflow({ force_run: true });
+      if (state.dashboard && state.dashboard.patterns) {
+        delete state.dashboard.patterns[pid];
+        state.dashboard.pattern_order = (state.dashboard.pattern_order || []).filter((id) => id !== pid);
+      }
+      if (state.selectedPatternId === pid) state.selectedPatternId = null;
+      renderDashboard();
+      showToast(`GitHubから「${target.mode_label}」を削除し、スナップショット更新を起動しました。`);
+    } catch (err) {
+      showToast(`GitHub削除エラー: ${err.message}`, true);
+    }
+    return;
+  }
   try {
     const resp = await fetch(`/api/patterns/${encodeURIComponent(pid)}`, { method: "DELETE" });
     const data = await resp.json();
@@ -1173,7 +1464,7 @@ async function deletePattern(pid) {
 
 async function handleResetSelected() {
   const p = getSelectedPatternData();
-  if (!p || !state.apiAvailable) return;
+  if (!p || !canEditPatterns()) return;
   const pid = p.pattern_id || p.mode;
   const capStr = prompt(
     `「${p.mode_label}」のシミュレーションをリセットします。\n新しい初期資金（円）を入力してください:`,
@@ -1183,6 +1474,21 @@ async function handleResetSelected() {
   const newCap = Number(capStr);
   if (!Number.isFinite(newCap) || newCap < 1000) {
     showToast("1,000円以上の数値を入力してください。", true);
+    return;
+  }
+  if (!state.apiAvailable && state.githubConnected) {
+    try {
+      const { cfg, sha } = await ghLoadRepoConfig();
+      const item = cfg.patterns.find((x) => x.id === pid);
+      if (item) {
+        item.initial_capital = newCap;
+        await ghSaveRepoConfig(cfg, sha, `chore(config): reset capital of ${pid} to ${newCap}`);
+      }
+      await ghDispatchMonitorWorkflow({ force_run: true, reset_pattern: pid });
+      showToast(`「${p.mode_label}」を元手 ${fmtJPY(newCap)} でリセットするよう GitHub Actions を起動しました（約1〜2分後に反映）。`);
+    } catch (err) {
+      showToast(`GitHubリセットエラー: ${err.message}`, true);
+    }
     return;
   }
   try {
@@ -1226,9 +1532,22 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("btnCollectMl").addEventListener("click", async () => {
-    if (!state.apiAvailable) return;
+    if (!canEditPatterns()) return;
     const btn = document.getElementById("btnCollectMl");
     btn.disabled = true;
+    if (!state.apiAvailable && state.githubConnected) {
+      btn.textContent = "⏳ GitHub Actions 起動中...";
+      try {
+        await ghDispatchMonitorWorkflow({ force_run: true, collect_ml: true });
+        showToast("GitHub Actions で外部マクロ＋長期60mデータの再収集＆ML再学習を起動しました（約2分後に反映）。");
+      } catch (err) {
+        showToast(`ML起動エラー: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "📥 外部データ収集＆再学習";
+      }
+      return;
+    }
     btn.textContent = "⏳ 学習データ収集＆再学習中...";
     try {
       const resp = await fetch("/api/ml/collect", { method: "POST" });
@@ -1242,9 +1561,83 @@ document.addEventListener("DOMContentLoaded", () => {
       showToast(`ML収集エラー: ${err.message}`, true);
     } finally {
       btn.disabled = false;
-      btn.textContent = "📥 学習データ収集＆再学習";
+      btn.textContent = "📥 外部データ収集＆再学習";
     }
   });
+
+  // GitHub Pages Direct Edit Connection Modal wiring
+  const openGithubModal = () => {
+    const form = document.getElementById("githubForm");
+    const defs = detectDefaultGithubRepo();
+    form.gh_owner.value = state.githubConfig.owner || defs.owner;
+    form.gh_repo.value = state.githubConfig.repo || defs.repo;
+    form.gh_token.value = state.githubConfig.token || "";
+    form.gh_remember.checked = Boolean(localStorage.getItem(GH_LOCAL_KEY));
+    document.getElementById("ghConnectError").classList.add("hidden");
+    document.getElementById("btnDisconnectGithub").classList.toggle("hidden", !state.githubConnected);
+    document.getElementById("githubModal").classList.remove("hidden");
+  };
+  document.getElementById("btnGithubConnect").addEventListener("click", openGithubModal);
+  document.getElementById("btnCloseGithubModal").addEventListener("click", () =>
+    document.getElementById("githubModal").classList.add("hidden")
+  );
+  document.getElementById("btnCancelGithubModal").addEventListener("click", () =>
+    document.getElementById("githubModal").classList.add("hidden")
+  );
+  document.getElementById("btnDisconnectGithub").addEventListener("click", () => {
+    sessionStorage.removeItem(GH_SESSION_KEY);
+    localStorage.removeItem(GH_LOCAL_KEY);
+    state.githubConnected = false;
+    state.githubConfig.token = "";
+    document.getElementById("githubModal").classList.add("hidden");
+    syncActionButtonsForMode();
+    renderDashboard();
+    showToast("GitHub 編集連携を解除しました。");
+  });
+  document.getElementById("githubForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const errEl = document.getElementById("ghConnectError");
+    const btn = document.getElementById("btnSaveGithub");
+    errEl.classList.add("hidden");
+    btn.disabled = true;
+    btn.textContent = "⏳ 接続確認中...";
+
+    const nextCfg = {
+      owner: form.gh_owner.value.trim(),
+      repo: form.gh_repo.value.trim(),
+      token: form.gh_token.value.trim(),
+      branch: "main",
+    };
+    const prevCfg = { ...state.githubConfig };
+    state.githubConfig = nextCfg;
+    try {
+      const resp = await ghApiFetch("");
+      if (!resp.ok) {
+        throw new Error(`接続できませんでした (HTTP ${resp.status})。リポジトリ名とトークンを確認してください。`);
+      }
+      state.githubConnected = true;
+      const serialized = JSON.stringify(nextCfg);
+      sessionStorage.setItem(GH_SESSION_KEY, serialized);
+      if (form.gh_remember.checked) {
+        localStorage.setItem(GH_LOCAL_KEY, serialized);
+      } else {
+        localStorage.removeItem(GH_LOCAL_KEY);
+      }
+      document.getElementById("githubModal").classList.add("hidden");
+      syncActionButtonsForMode();
+      renderDashboard();
+      showToast("GitHub 編集連携を有効化しました！このページから直接パターンの追加・編集・削除ができます。");
+    } catch (err) {
+      state.githubConfig = prevCfg;
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "接続して編集を有効化";
+    }
+  });
+
   document.getElementById("btnLogout").addEventListener("click", handleLogout);
   document.getElementById("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();

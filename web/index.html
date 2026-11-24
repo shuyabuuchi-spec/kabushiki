@@ -39,6 +39,9 @@
       <div id="connectionBadge" class="pill pill-neutral">接続確認中...</div>
       <div id="marketStatusBadge" class="pill pill-neutral">東証ステータス取得中...</div>
       <div class="action-group">
+        <button id="btnGithubConnect" class="btn btn-ghost hidden" title="GitHub Pages上から直接パターン追加・編集・削除するためのトークン連携">
+          ☁ GitHub編集連携
+        </button>
         <button id="btnCatchup" class="btn btn-primary" title="全有効パターンを並行でPC OFF補完＋最新スキャン">
           ⚡ 全パターン最新スキャン＆補完
         </button>
@@ -532,6 +535,45 @@
         <div class="modal-actions">
           <button type="button" id="btnCancelPatternModal" class="btn btn-ghost">キャンセル</button>
           <button type="submit" class="btn btn-primary">パターンを保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- GitHub API Direct Edit Connection Modal (for GitHub Pages mode) -->
+  <div id="githubModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="GitHub 編集連携設定">
+    <div class="modal-content" style="max-width: 540px;">
+      <div class="modal-header">
+        <h2>☁ GitHub Pages 直接編集連携（パターン追加・編集・削除）</h2>
+        <button id="btnCloseGithubModal" class="btn btn-ghost btn-sm">✕</button>
+      </div>
+      <p class="card-desc" style="margin-bottom:14px;line-height:1.6;">
+        GitHub の <b>Fine-grained Personal Access Token</b> を設定すると、ローカルサーバーを起動せずにこの公開ページ（スマホ含む）から直接パターンの追加・編集・削除・即時シミュレーション実行ができます。<br/>
+        作成先：<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener" style="color:#60a5fa;">GitHub Fine-grained tokens 作成ページ</a><br/>
+        必要な権限（対象リポジトリ <code>kabushiki</code> のみ）：<b>Contents: Read and write</b> ／ <b>Actions: Read and write</b>
+      </p>
+      <form id="githubForm" class="config-grid">
+        <label>
+          <span>GitHub ユーザー名 (Owner)</span>
+          <input name="gh_owner" type="text" required class="text-input" placeholder="shuyabuuchi-spec" />
+        </label>
+        <label>
+          <span>リポジトリ名 (Repo)</span>
+          <input name="gh_repo" type="text" required class="text-input" placeholder="kabushiki" />
+        </label>
+        <label class="full-span">
+          <span>Fine-grained Personal Access Token (github_pat_...)</span>
+          <input name="gh_token" type="password" required class="text-input" placeholder="github_pat_..." autocomplete="off" />
+        </label>
+        <label class="checkbox-label">
+          <input name="gh_remember" type="checkbox" />
+          <span>このブラウザ（localStorage）にトークンを記憶する（共有PCではOFF推奨）</span>
+        </label>
+        <div id="ghConnectError" class="login-error full-span hidden"></div>
+        <div class="modal-actions">
+          <button type="button" id="btnDisconnectGithub" class="btn btn-danger-ghost hidden">連携解除</button>
+          <button type="button" id="btnCancelGithubModal" class="btn btn-ghost">キャンセル</button>
+          <button type="submit" id="btnSaveGithub" class="btn btn-primary">接続して編集を有効化</button>
         </div>
       </form>
     </div>
