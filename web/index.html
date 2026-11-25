@@ -18,10 +18,21 @@
           <span>パスワード</span>
           <input id="loginPassphrase" type="password" autocomplete="current-password" required class="text-input" placeholder="パスフレーズを入力..." />
         </label>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+          <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:0.8rem;cursor:pointer;">
+            <input id="loginRemember" type="checkbox" checked />
+            <span>この端末でログインを記憶する</span>
+          </label>
+          <select id="loginRememberDays" class="select-input" style="padding:4px 8px;font-size:0.78rem;">
+            <option value="1">24時間</option>
+            <option value="7" selected>7日間</option>
+            <option value="30">30日間</option>
+          </select>
+        </div>
         <div id="loginError" class="login-error hidden">パスワードが正しくないため復号できませんでした。</div>
         <button type="submit" id="btnUnlock" class="btn btn-primary full-width">🔓 復号してログイン</button>
       </form>
-      <p class="login-note">※ パスワードはサーバーへ送信されず、現在のタブ内のみで利用されます。</p>
+      <p class="login-note">※ 5回連続で間違えると一時的にアクセスがロックされます（初回15分）。共有PCでは「記憶する」をOFFにしてください。</p>
     </div>
   </div>
 

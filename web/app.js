@@ -14,8 +14,140 @@ const state = {
 };
 
 const SESSION_KEY = "kabushiki_unlock_pass";
+const LOCAL_PASS_KEY = "kabushiki_unlock_local_v1";
+const LOGIN_GUARD_KEY = "kabushiki_login_guard_v1";
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCKOUT_MINUTES_SCHEDULE = [15, 30, 60];
 const GH_SESSION_KEY = "kabushiki_gh_edit_session";
 const GH_LOCAL_KEY = "kabushiki_gh_edit_local";
+
+let lockoutTimerId = null;
+
+function getLoginGuard() {
+  try {
+    const raw = localStorage.getItem(LOGIN_GUARD_KEY);
+    if (!raw) return { attempts: 0, lockedUntil: 0, lockCount: 0 };
+    const parsed = JSON.parse(raw);
+    return {
+      attempts: Number(parsed.attempts || 0),
+      lockedUntil: Number(parsed.lockedUntil || 0),
+      lockCount: Number(parsed.lockCount || 0),
+    };
+  } catch {
+    return { attempts: 0, lockedUntil: 0, lockCount: 0 };
+  }
+}
+
+function saveLoginGuard(guard) {
+  try {
+    localStorage.setItem(LOGIN_GUARD_KEY, JSON.stringify(guard));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function resetLoginGuard() {
+  saveLoginGuard({ attempts: 0, lockedUntil: 0, lockCount: 0 });
+  if (lockoutTimerId) {
+    clearInterval(lockoutTimerId);
+    lockoutTimerId = null;
+  }
+}
+
+function recordFailedLoginAttempt() {
+  const guard = getLoginGuard();
+  guard.attempts += 1;
+  if (guard.attempts >= MAX_LOGIN_ATTEMPTS) {
+    const idx = Math.min(guard.lockCount, LOCKOUT_MINUTES_SCHEDULE.length - 1);
+    const lockMins = LOCKOUT_MINUTES_SCHEDULE[idx];
+    guard.lockedUntil = Date.now() + lockMins * 60 * 1000;
+    guard.lockCount += 1;
+  }
+  saveLoginGuard(guard);
+  return guard;
+}
+
+function formatRemainingTime(ms) {
+  const totalSec = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}分${String(s).padStart(2, "0")}秒`;
+}
+
+function updateLockoutUI() {
+  const passInput = document.getElementById("loginPassphrase");
+  const btn = document.getElementById("btnUnlock");
+  const errEl = document.getElementById("loginError");
+  if (!passInput || !btn || !errEl) return false;
+
+  const guard = getLoginGuard();
+  const remaining = guard.lockedUntil - Date.now();
+  if (remaining > 0) {
+    passInput.disabled = true;
+    btn.disabled = true;
+    btn.textContent = `🔒 ロック中 (${formatRemainingTime(remaining)})`;
+    errEl.textContent = `🚫 パスワードを${MAX_LOGIN_ATTEMPTS}回連続で間違えたため、一時的にアクセスをロックしています。解除まで残り ${formatRemainingTime(remaining)}`;
+    errEl.classList.remove("hidden");
+    if (!lockoutTimerId) {
+      lockoutTimerId = setInterval(() => {
+        const stillLocked = updateLockoutUI();
+        if (!stillLocked && lockoutTimerId) {
+          clearInterval(lockoutTimerId);
+          lockoutTimerId = null;
+        }
+      }, 1000);
+    }
+    return true;
+  }
+
+  // Lock expired -> re-enable input & reset attempt counter (keep lockCount until successful login)
+  if (guard.lockedUntil > 0) {
+    saveLoginGuard({ attempts: 0, lockedUntil: 0, lockCount: guard.lockCount });
+    errEl.textContent = "一時ロックが解除されました。正しいパスワードを入力してください。";
+    errEl.classList.remove("hidden");
+  }
+  passInput.disabled = false;
+  btn.disabled = false;
+  btn.textContent = "🔓 復号してログイン";
+  return false;
+}
+
+function getStoredPassphrase() {
+  const sess = sessionStorage.getItem(SESSION_KEY);
+  if (sess) return sess;
+  try {
+    const raw = localStorage.getItem(LOCAL_PASS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.pass && Number(parsed.expiresAt || 0) > Date.now()) {
+      return String(parsed.pass);
+    }
+    localStorage.removeItem(LOCAL_PASS_KEY);
+  } catch {
+    localStorage.removeItem(LOCAL_PASS_KEY);
+  }
+  return null;
+}
+
+function persistPassphrase(passphrase, remember, days) {
+  sessionStorage.setItem(SESSION_KEY, passphrase);
+  if (remember) {
+    const ttlDays = Math.max(1, Math.min(90, Number(days || 7)));
+    const expiresAt = Date.now() + ttlDays * 24 * 60 * 60 * 1000;
+    try {
+      localStorage.setItem(LOCAL_PASS_KEY, JSON.stringify({ pass: passphrase, expiresAt }));
+    } catch {
+      // ignore storage errors
+    }
+  } else {
+    localStorage.removeItem(LOCAL_PASS_KEY);
+  }
+}
+
+function clearStoredPassphrase() {
+  sessionStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(LOCAL_PASS_KEY);
+}
 
 function canEditPatterns() {
   return state.apiAvailable || state.githubConnected;
@@ -249,11 +381,16 @@ function setStaticButtonsDisabled() {
   syncActionButtonsForMode();
 }
 
-async function tryUnlockWithPassphrase(passphrase) {
+async function tryUnlockWithPassphrase(passphrase, persistOpts = null) {
   if (!state.encryptedEnvelope) return false;
   const decrypted = await decryptDashboardEnvelope(state.encryptedEnvelope, passphrase);
   state.dashboard = decrypted;
-  sessionStorage.setItem(SESSION_KEY, passphrase);
+  resetLoginGuard();
+  if (persistOpts) {
+    persistPassphrase(passphrase, persistOpts.remember, persistOpts.days);
+  } else {
+    sessionStorage.setItem(SESSION_KEY, passphrase);
+  }
   document.getElementById("loginOverlay").classList.add("hidden");
   document.getElementById("loginError").classList.add("hidden");
   document.getElementById("btnLogout").classList.remove("hidden");
@@ -266,13 +403,15 @@ async function tryUnlockWithPassphrase(passphrase) {
 }
 
 function handleLogout() {
-  sessionStorage.removeItem(SESSION_KEY);
+  clearStoredPassphrase();
   state.dashboard = null;
   document.getElementById("btnLogout").classList.add("hidden");
   document.getElementById("loginPassphrase").value = "";
   document.getElementById("loginError").classList.add("hidden");
   document.getElementById("loginOverlay").classList.remove("hidden");
-  document.getElementById("loginPassphrase").focus();
+  if (!updateLockoutUI()) {
+    document.getElementById("loginPassphrase").focus();
+  }
 }
 
 const fmtJPY = (n) => "¥" + Math.round(Number(n || 0)).toLocaleString("ja-JP");
@@ -1023,19 +1162,21 @@ async function loadDashboard() {
       if (envelope && envelope.encrypted) {
         state.encryptedMode = true;
         state.encryptedEnvelope = envelope;
-        const savedPass = sessionStorage.getItem(SESSION_KEY);
-        if (savedPass) {
+        const savedPass = getStoredPassphrase();
+        if (savedPass && getLoginGuard().lockedUntil <= Date.now()) {
           try {
             await tryUnlockWithPassphrase(savedPass);
             return;
           } catch {
-            sessionStorage.removeItem(SESSION_KEY);
+            clearStoredPassphrase();
           }
         }
         connBadge.textContent = "🔒 暗号化ロック中";
         connBadge.className = "pill pill-warn";
         document.getElementById("loginOverlay").classList.remove("hidden");
-        document.getElementById("loginPassphrase").focus();
+        if (!updateLockoutUI()) {
+          document.getElementById("loginPassphrase").focus();
+        }
         return;
       }
     }
@@ -1718,21 +1859,37 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btnLogout").addEventListener("click", handleLogout);
   document.getElementById("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (updateLockoutUI()) return;
+
     const passInput = document.getElementById("loginPassphrase");
+    const rememberEl = document.getElementById("loginRemember");
+    const daysEl = document.getElementById("loginRememberDays");
     const errEl = document.getElementById("loginError");
     const btn = document.getElementById("btnUnlock");
     btn.disabled = true;
     btn.textContent = "⏳ 復号中...";
     errEl.classList.add("hidden");
     try {
-      await tryUnlockWithPassphrase(passInput.value);
+      await tryUnlockWithPassphrase(passInput.value, {
+        remember: rememberEl ? rememberEl.checked : false,
+        days: daysEl ? Number(daysEl.value) : 7,
+      });
     } catch {
-      errEl.classList.remove("hidden");
-      passInput.select();
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "🔓 復号してログイン";
+      const guard = recordFailedLoginAttempt();
+      if (guard.lockedUntil > Date.now()) {
+        updateLockoutUI();
+      } else {
+        const left = Math.max(0, MAX_LOGIN_ATTEMPTS - guard.attempts);
+        errEl.textContent = `パスワードが正しくありません（失敗 ${guard.attempts} / ${MAX_LOGIN_ATTEMPTS}回：あと ${left} 回間違えると一時ロックされます）`;
+        errEl.classList.remove("hidden");
+        btn.disabled = false;
+        btn.textContent = "🔓 復号してログイン";
+        passInput.select();
+      }
+      return;
     }
+    btn.disabled = false;
+    btn.textContent = "🔓 復号してログイン";
   });
 
   loadDashboard();
